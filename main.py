@@ -1,5 +1,5 @@
 # ==========================================
-# AI COIN ASSISTANT - V21C ORTAK V1 | ERKEN + PARCALI + KAR KORU
+# AI COIN ASSISTANT - V21C ORTAK V2 ORTA-SIKI | ERKEN + PARCALI + KAR KORU
 # Taban: main_20_coklu_guc_siklastirilmis.py
 # Fast Scan V1: 60 sn hızlı ön tarama + 5 dk tam tarama
 # AL Relax V1: normal AL için ADX 27 / AI 80
@@ -1351,7 +1351,7 @@ def canli_kazananlari_bul(btc_3s, simdi=None):
 while True:
     try:
         print()
-        print("AI COIN ASSISTANT - V21C ORTAK V1 | ERKEN + PARCALI + KAR KORU")
+        print("AI COIN ASSISTANT - V21C ORTAK V2 ORTA-SIKI | ERKEN + PARCALI + KAR KORU")
         print("--------------------------------")
 
         btc_d = btc_degisimleri()
@@ -1907,23 +1907,42 @@ while True:
                 # FINAL ORTAK KAPI:
                 # 21C yarışı kazanmış + geç kalmamış + teknik/kalite/devam yeterli.
                 gec = a.get("giris_turu_ortak") == "GEC"
-                ai_ok = float(a.get("ai_skoru", 0) or 0) >= 80
-                giris_ok = float(a.get("giris_kalitesi_ortak", 0) or 0) >= 70
-                devam_ok = float(a.get("devam_gucu_ortak", 0) or 0) >= 60
+                ai_ok = float(a.get("ai_skoru", 0) or 0) >= 82
+                giris_ok = float(a.get("giris_kalitesi_ortak", 0) or 0) >= 75
+                devam_ok = float(a.get("devam_gucu_ortak", 0) or 0) >= 68
 
-                if gec or not (ai_ok and giris_ok and devam_ok):
+                teknik = a.get("teknik") or {}
+                try:
+                    adx = float(teknik.get("adx", 0) or 0)
+                except Exception:
+                    adx = 0.0
+                try:
+                    rsi = float(teknik.get("rsi", 999) or 999)
+                except Exception:
+                    rsi = 999.0
+                try:
+                    hacim = float(a.get("hacim", 0) or 0)
+                except Exception:
+                    hacim = 0.0
+
+                adx_ok = adx >= 24
+                rsi_ok = rsi <= 74
+                hacim_ok = hacim >= 0.50
+
+                if gec or not (ai_ok and giris_ok and devam_ok and adx_ok and rsi_ok and hacim_ok):
                     print(
                         f"[ORTAK FILTRE] {symbol} elendi | "
                         f"gec={gec} | AI={a.get('ai_skoru')} | "
                         f"Giris={a.get('giris_kalitesi_ortak')} | "
-                        f"Devam={a.get('devam_gucu_ortak')} | Yaris={yaris_skoru}"
+                        f"Devam={a.get('devam_gucu_ortak')} | "
+                        f"ADX={adx} | RSI={rsi} | Hacim={hacim} | Yaris={yaris_skoru}"
                     )
                     continue
 
                 if (
                     float(a.get("giris_kalitesi_ortak", 0) or 0) >= 90
-                    and float(a.get("devam_gucu_ortak", 0) or 0) >= 75
-                    and float(a.get("ai_skoru", 0) or 0) >= 85
+                    and float(a.get("devam_gucu_ortak", 0) or 0) >= 78
+                    and float(a.get("ai_skoru", 0) or 0) >= 88
                 ):
                     a["final_etiket"] = "🟢 ÇOK GÜÇLÜ AL"
                 elif (
