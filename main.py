@@ -1,5 +1,5 @@
 # ==========================================
-# AI COIN ASSISTANT - V21C ORTAK V4 | 4 MOTOR ORTAK AL KARARI | ERKEN + PARCALI + KAR KORU
+# AI COIN ASSISTANT - 13 TABANLI BIRLESIK V1 | 13 KARAR + 21C ERKENLIK + RADAR KALITE
 # Taban: main_20_coklu_guc_siklastirilmis.py
 # Fast Scan V1: 60 sn hızlı ön tarama + 5 dk tam tarama
 # AL Relax V1: normal AL için ADX 27 / AI 80
@@ -1394,36 +1394,13 @@ def canli_kazananlari_bul(btc_3s, simdi=None):
             and macd_hist is not None and macd_hist > 0
             and adx is not None and adx >= 24
         )
-        yaris_al = (
-            not eski_al
-            and teknik_temiz
-            and ai >= 72
-            and radar >= 48
-            and yaris >= 70
-            and btc_fark3 >= -0.2
-            and not any("Giriş geç" in str(x) for x in nedenler)
-        )
-
-        # V21C kısa-vade AL yolu: eski 1s/3s hareketin büyümesini beklemez.
-        # Coin henüz şişmeden 1-3-5-10dk ivmesi + hacim + mikro basamak ile öne çıkabilir.
-        mikro_al = (
-            not eski_al
-            and mikro_skor >= 68
-            and not mikro.get("sisti", False)
-            and float(mikro.get("d3", 0) or 0) >= 0.35
-            and float(mikro.get("d5", 0) or 0) >= 0.55
-            and (mikro.get("hacim_ivmeleniyor") or float(mikro.get("hacim1x", 0) or 0) >= 1.5)
-            and (mikro.get("fiyat_ivmeleniyor") or mikro.get("mikro_basamak"))
-            and ai >= 66
-            and radar >= 40
-            and yaris >= 68
-            and btc_fark3 >= -0.5
-            and not any("Giriş geç" in str(x) for x in nedenler)
-        )
+        # 13 TABANLI: yarış/mikro artık tek başına AL üretemez.
+        yaris_al = False
+        mikro_al = False
 
         if mikro.get("sisti", False):
             continue
-        if not (eski_al or yaris_al or mikro_al):
+        if not eski_al:
             continue
         if yaris < CANLI_MIN_YARIS_SKORU:
             continue
@@ -1432,7 +1409,7 @@ def canli_kazananlari_bul(btc_3s, simdi=None):
         if float(aday.get("degisim1", 0) or 0) < 0:
             continue
 
-        aday["canli_final_tipi"] = "ESKI_AL" if eski_al else ("MIKRO_AL" if mikro_al else "YARIS_AL")
+        aday["canli_final_tipi"] = "13_AL"
         uygun.append((yaris, ai, symbol, aday, kayit))
 
     uygun.sort(reverse=True, key=lambda x: (x[0], x[1]))
@@ -1442,7 +1419,7 @@ def canli_kazananlari_bul(btc_3s, simdi=None):
 while True:
     try:
         print()
-        print("AI COIN ASSISTANT - V21C ORTAK V4 | 4 MOTOR ORTAK AL KARARI | ERKEN + PARCALI + KAR KORU")
+        print("AI COIN ASSISTANT - 13 TABANLI BIRLESIK V1 | 13 KARAR + 21C ERKENLIK + RADAR KALITE")
         print("--------------------------------")
 
         btc_d = btc_degisimleri()
@@ -2018,16 +1995,16 @@ while True:
                 a["yaris_suresi_dk"] = round((time.time() - kayit.get("ilk_zaman", time.time())) / 60, 1)
                 a["yaris_gozlem"] = kayit.get("gozlem", 0)
 
-                # FINAL ORTAK KAPI:
-                # 21C yarışı kazanmış + geç kalmamış + teknik/kalite/devam yeterli.
-                # ==========================================================
-                # V4 - DÖRT MOTOR ORTAK AL KARARI
-                # Tek bir motorun AL demesi yetmez. En az 3/4 onay gerekir.
-                # ==========================================================
+                # 13 TABANLI BIRLESIK KARAR
+                # 13 AL demediyse birleşik bot AL vermez.
+                # 21C erkenlik/sıralama sağlar; Radar kalite verir; Radar+AL yalnız veto eder.
+                onuc_al = "🟢 AL" in str(a.get("karar", ""))
+                if not onuc_al:
+                    print(f"[13 TABAN] {symbol} 13 AL demedi -> sessiz.")
+                    continue
+
                 gec = a.get("giris_turu_ortak") == "GEC"
                 teknik = a.get("teknik") or {}
-                mikro = a.get("mikro") or {}
-
                 try:
                     adx = float(teknik.get("adx", 0) or 0)
                 except Exception:
@@ -2040,133 +2017,55 @@ while True:
                     hacim = float(a.get("hacim", 0) or 0)
                 except Exception:
                     hacim = 0.0
-                try:
-                    ai_skoru = float(a.get("ai_skoru", 0) or 0)
-                except Exception:
-                    ai_skoru = 0.0
-                try:
-                    radar_skoru = float(a.get("radar_skoru", 0) or 0)
-                except Exception:
-                    radar_skoru = 0.0
-                try:
-                    giris_k = float(a.get("giris_kalitesi_ortak", 0) or 0)
-                except Exception:
-                    giris_k = 0.0
-                try:
-                    devam_g = float(a.get("devam_gucu_ortak", 0) or 0)
-                except Exception:
-                    devam_g = 0.0
 
+                giris_k = float(a.get("giris_kalitesi_ortak", 0) or 0)
+                devam_g = float(a.get("devam_gucu_ortak", 0) or 0)
                 ema20 = teknik.get("ema20")
                 ema50 = teknik.get("ema50")
-                fiyat = float(a.get("fiyat", 0) or 0)
-                ema_ok = (
-                    ema20 is not None and ema50 is not None
-                    and float(ema20) > float(ema50)
-                    and fiyat > float(ema20)
-                )
-                macd_ok = teknik.get("macd_hist") is not None and teknik.get("macd_hist") > 0
+                macd_hist = teknik.get("macd_hist")
 
-                d3m = float(mikro.get("d3", 0) or 0)
-                d5m = float(mikro.get("d5", 0) or 0)
-                hacim1x = float(mikro.get("hacim1x", 0) or 0)
-                hacim_ivme = float(mikro.get("hacim3_ivme", 0) or 0)
-
-                # Sert güvenlik kapısı: 4/4 onay olsa bile bunlar bozuksa AL yok.
-                hard_block = (
+                # Sert veto: 13'ün AL'ını yalnız gerçekten kötü yapı iptal eder.
+                teknik_veto = (
                     gec
-                    or rsi > 74
                     or adx < 24
+                    or rsi > 74
                     or hacim < 0.50
-                    or not ema_ok
-                    or not macd_ok
+                    or ema20 is None
+                    or ema50 is None
+                    or ema20 <= ema50
+                    or macd_hist is None
+                    or macd_hist <= 0
                 )
-
-                # 1) 21C kısa-vade + canlı yarış
-                oy_21c = (
-                    yaris_skoru >= 72
-                    and d3m >= 0
-                    and d5m >= 0
-                    and (hacim1x >= 0.80 or hacim_ivme >= 1.00)
-                    and not gec
-                )
-
-                # 2) 13 AL erken/teknik motoru
-                oy_13 = (
-                    ai_skoru >= 84
-                    and ema_ok
-                    and macd_ok
-                    and adx >= 27
-                    and 50 <= rsi <= 72
-                    and float(a.get("degisim1", 0) or 0) < 5.0
-                    and float(a.get("degisim3", 0) or 0) < 8.0
-                )
-
-                # 3) Coin Radar giriş kalitesi + devam gücü
-                oy_radar = (
-                    giris_k >= 80
-                    and devam_g >= 70
-                    and radar_skoru >= 55
-                    and hacim >= 0.50
-                )
-
-                # 4) Radar + AL teknik ortak teyidi
-                teknik_puan = sum([
-                    1 if ema_ok else 0,
-                    1 if (50 <= rsi <= 72) else 0,
-                    1 if adx >= 24 else 0,
-                    1 if macd_ok else 0,
-                ])
-                oy_radar_al = (
-                    teknik_puan == 4
-                    and ai_skoru >= 82
-                    and radar_skoru >= 50
-                    and giris_k >= 75
-                )
-
-                oylar = {
-                    "21C": oy_21c,
-                    "13": oy_13,
-                    "RADAR": oy_radar,
-                    "RADAR+AL": oy_radar_al,
-                }
-                onay_sayisi = sum(1 for v in oylar.values() if v)
-                a["dortlu_oylar"] = oylar
-                a["dortlu_onay"] = onay_sayisi
-                a["teknik_puan"] = teknik_puan
-
-                # Yalnız 21C gördü diye artık AL mesajı çıkmaz.
-                if hard_block or onay_sayisi < 3:
+                if teknik_veto:
                     print(
-                        f"[4 MOTOR] {symbol} sessiz izleme | "
-                        f"Onay={onay_sayisi}/4 | Oylar={oylar} | "
-                        f"AI={ai_skoru:.1f} Radar={radar_skoru:.1f} "
-                        f"Giris={giris_k:.1f} Devam={devam_g:.1f} "
-                        f"RSI={rsi:.1f} ADX={adx:.1f} Hacim={hacim:.2f}"
+                        f"[13 + TEKNIK VETO] {symbol} | "
+                        f"ADX={adx} RSI={rsi} Hacim={hacim} Giris={giris_k} Devam={devam_g}"
                     )
                     continue
 
-                if (
-                    onay_sayisi == 4
-                    and giris_k >= 90
-                    and devam_g >= 78
-                    and ai_skoru >= 88
-                ):
+                # Radar tarafı ancak ikisi birden çok zayıfsa veto eder.
+                if giris_k < 65 and devam_g < 60:
+                    print(f"[13 + RADAR VETO] {symbol} | Giris={giris_k} Devam={devam_g}")
+                    continue
+
+                # Etiketler sadece kaliteyi anlatır; AL kararını 13 vermiştir.
+                if giris_k >= 90 and devam_g >= 78 and float(a.get("ai_skoru", 0) or 0) >= 88 and yaris_skoru >= 75:
                     a["final_etiket"] = "🟢 ÇOK GÜÇLÜ AL"
-                elif onay_sayisi == 4:
+                elif giris_k >= 80 and devam_g >= 70:
                     a["final_etiket"] = "🟢 GÜÇLÜ AL"
                 elif a.get("giris_turu_ortak") == "ERKEN":
                     a["final_etiket"] = "🌱 ERKEN AL"
                 else:
                     a["final_etiket"] = "🟢 AL"
 
+                a["onay_modeli"] = "13 AL + 21C erkenlik + Radar kalite + teknik veto"
                 gonderilecekler.append(a)
 
             if not gonderilecekler:
                 print("Canlı yarışta olgunlaşmış yeni AL kazananı yok. Telegram sessiz.")
             else:
                 mesaj = (
-                    "🟢 AL - CANLI YARIŞ KAZANANI\n"
+                    "🤖 13 TABANLI BIRLESIK AL\n"
                     f"BTC 3s: %{round(btc, 2)}\n\n"
                 )
 
@@ -2208,8 +2107,8 @@ while True:
                         f"📊 Skorlar\n"
                         f"AI: {a.get('ai_skoru', 0)}/100 | Radar: {a.get('radar_skoru', 0)}/100\n"
                         f"🎯 Giriş: {a.get('giris_kalitesi_ortak', 0)}/100 | 🚀 Devam: {a.get('devam_gucu_ortak', 0)}/100\n"
-                        f"🏁 Yarış: #{a.get('yaris_sirasi', '?')} | Güç: {a.get('yaris_skoru', 0)}/100\n"
-                        f"🤝 Ortak Onay: {a.get('dortlu_onay', 0)}/4 | Teknik: {a.get('teknik_puan', 0)}/4\n\n"
+                        f"🏁 21C Yarış: #{a.get('yaris_sirasi', '?')} | Güç: {a.get('yaris_skoru', 0)}/100\n"
+                        f"✅ Ana karar: 13 AL | Diğerleri: kalite/veto\n\n"
 
                         f"📈 Hareket\n"
                         f"1dk: %{(a.get('mikro') or {}).get('d1', 0)} | 3dk: %{(a.get('mikro') or {}).get('d3', 0)} | "
@@ -2226,7 +2125,6 @@ while True:
                         f"Kâr koru: +%{KAR_AL_1_ESIK:.1f} | Zarar sınırı: %{ILK_ZARAR_KES:.1f}\n\n"
 
                         f"💵 Fiyat: {round(a['fiyat'], 4)}\n"
-                        f"✅ Onaylayanlar: {', '.join([k for k, v in a.get('dortlu_oylar', {}).items() if v])}\n"
                         f"{neden_alarm}📝 Neden: {neden}\n\n"
                     )
 
