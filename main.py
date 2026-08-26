@@ -1,5 +1,6 @@
 # ==========================================
-# BIRLESIK 4 BOT - V1 | V13 AL/SAT TABANI
+# AI COIN ASSISTANT - V21C ORTAK V1 | ERKEN + PARCALI + KAR KORU
+# Taban: main_20_coklu_guc_siklastirilmis.py
 # Fast Scan V1: 60 sn hızlı ön tarama + 5 dk tam tarama
 # AL Relax V1: normal AL için ADX 27 / AI 80
 # Final Cleanup / Core Candidate Scanner
@@ -13,12 +14,9 @@ import requests
 import feedparser
 
 
-# Humanity Railway projesiyle aynı Telegram değişkenlerini kullanır.
-# Railway > Variables tarafında mevcut değerler otomatik okunur;
-# token/chat ID GitHub koduna yazılmaz.
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-CHAT_IDS = [TELEGRAM_CHAT_ID] if TELEGRAM_CHAT_ID else []
+
+CHAT_IDS = [1877715122, 2097448038]
 
 TARAMA_SURESI = 60
 TAM_TARAMA_DONGUSU = 5          # 5 x 60 sn = yaklaşık 5 dk
@@ -32,219 +30,61 @@ onceki_tarama = {}
 # Çoklu Güç Havuzu:
 # Güçlenme işareti veren coin 5 dakika boyunca, 1 dk fiyat hareketi %0.40 altında kalsa bile izlenir.
 guc_izleme_havuzu = {}
-GUC_IZLEME_SURESI = 5 * 60
+GUC_IZLEME_SURESI = 10 * 60
 
 # Aynı kararın tekrar Telegram gönderimini engeller.
 son_ai_kararlar = {}
 
-# ==========================================
-# V13 AL/SAT - AL SONRASI POZİSYON TAKİBİ
-# 13'ün erken/gevşek aday seçimi korunur.
-# AL verilen coin her 60 sn takip edilir; emir göndermez, yalnızca mesaj üretir.
-# ==========================================
-TAKIP_DOSYASI = "v13_al_sat_takip_state.json"
+# V21C - Kısa vade erken yakalama + canlı aday yarışı:
+# 1s/3s artık aday bulmanın ana motoru değildir.
+# Adaylar 1-3-5-10 dakikalık fiyat/hacim ivmesinden doğar;
+# 1s/3s yalnızca trend/risk onayı olarak kullanılır.
+canli_aday_havuzu = {}
+CANLI_MIN_BEKLEME = 2 * 60
+CANLI_MAX_BEKLEME = 10 * 60
+CANLI_MIN_GOZLEM = 2
+CANLI_MAX_KAZANAN = 2
+CANLI_MIN_YARIS_SKORU = 66
+BTC_SERT_ZAYIFLIK_ESIGI = -2.0
+
+# ============================================================
+# ORTAK V1 - 21C + 22 PARCALI + KAR KORU + 13 ERKENLIK FILTRESI
+# Emir vermez; Telegram karar/yonetim mesaji uretir.
+# ============================================================
+TAKIP_DOSYASI = "v21c_ortak_takip_state.json"
 AL_TAKIP = {}
-KAR_AL_1_ESIK = 3.0          # İlk AL fiyatına göre +%3
-KAR_AL_1_ORAN = 40           # İlk kârda pozisyonun %40'ını koru
-ILK_ZARAR_KES = -1.50        # İlk AL doğrulanmazsa yaklaşık -%1.5
-TEPE_GERI_VERME = -1.40      # Kâr alındıktan sonra tepeden %1.4 geri verme
-MIN_KAR_KORUMA = 2.50        # Trailing korumanın aktif sayıldığı minimum kâr
 
-# ==========================================
-# V13 ERKENLİK FİLTRESİ
-# Amaç: güçlü ama şişmiş coini AL diye kovalamamak.
-# 13'ün aday bulma yeteneği korunur; sadece giriş türü yeniden sınıflanır.
-# ==========================================
-ERKEN_1S_MAX = 3.00
-ERKEN_RSI_MAX = 70.0
-GEC_1S_ESIK = 3.50
-GEC_RSI_ESIK = 74.0
-GEC_1S_MUTLAK = 5.00
-GEC_3S_MUTLAK = 8.00
+# 22 parcali giris plani
+KADEME_1_ORAN = 30
+KADEME_2_ORAN = 30
+KADEME_3_ORAN = 40
+KADEME_2_ESIK = 0.80   # ilk girise gore +%0.8
+KADEME_3_ESIK = 1.80   # ilk girise gore +%1.8
 
-def giris_zamanlamasi(aday):
-    teknik = aday.get("teknik") or {}
-    d1 = float(aday.get("degisim1", 0) or 0)
-    d3 = float(aday.get("degisim3", 0) or 0)
-    rsi = teknik.get("rsi")
+# 21 kar-koru / 13 AL-SAT
+KAR_AL_1_ESIK = 3.0
+KAR_AL_1_ORAN = 40
+ILK_ZARAR_KES = -1.50
+TEPE_GERI_VERME = -1.40
+MIN_KAR_KORUMA = 2.50
+
+# 13'ten gelen "gec kalma" fikrini 21C'nin mikro zamanina uyarladik.
+# Amaç: coin guclu olsa da hareketin sonundan AL dememek.
+MIKRO_GEC_3DK = 4.50
+MIKRO_GEC_5DK = 5.50
+MIKRO_GEC_10DK = 7.00
+TREND_GEC_1S = 5.00
+RSI_GEC = 74.0
+
+def _pct(yeni, eski):
     try:
-        rsi = float(rsi) if rsi is not None else None
-    except Exception:
-        rsi = None
-
-    # Tek başına güçlü görünmek yeterli değil. Çoktan kaçmışsa yeni giriş yok.
-    gec = (
-        d1 >= GEC_1S_MUTLAK
-        or d3 >= GEC_3S_MUTLAK
-        or (d1 >= GEC_1S_ESIK and rsi is not None and rsi >= GEC_RSI_ESIK)
-    )
-    if gec:
-        return "GEC", "⛔ GEÇ / ALMA"
-
-    # Henüz şişmemiş, kısa güçlenme işaretleri olan sinyali öne çıkar.
-    erken = (
-        d1 <= ERKEN_1S_MAX
-        and (rsi is None or rsi <= ERKEN_RSI_MAX)
-        and (
-            aday.get("erken_aday")
-            or aday.get("hacim_hizlaniyor")
-            or aday.get("momentum_hizlaniyor")
-            or aday.get("basamakli_trend")
-        )
-    )
-    if erken:
-        return "ERKEN", "🌱 ERKEN AL"
-
-    return "DEVAM", "🟢 DEVAM AL"
-
-
-# ==========================================
-# 4 BOT BIRLESIK KARAR KATMANI V1
-# 13 erken yakalama + AI teknik kalite + Radar V5.5.1 giris/devam mantigi
-# + 21B canli yaris fikrini tek puanda birlestirir.
-# Amaç daha fazla mesaj değil; aynı fırsat için tek ve daha kaliteli karar.
-# ==========================================
-BIRLESIK_MIN_GIRIS = 68
-BIRLESIK_MIN_DEVAM = 52
-BIRLESIK_MIN_SKOR = 70
-BIRLESIK_MAX_MESAJ = 2
-
-
-def _clamp100(x):
-    try:
-        return round(max(0.0, min(100.0, float(x))), 1)
+        yeni = float(yeni)
+        eski = float(eski)
+        if eski == 0:
+            return 0.0
+        return ((yeni / eski) - 1.0) * 100
     except Exception:
         return 0.0
-
-
-def birlesik_giris_kalitesi(aday):
-    """Radar'ın giriş kalitesi fikrini mevcut 13 verileriyle hesaplar.
-    Şişmiş hareketi özellikle cezalandırır; erken ama temiz yapıyı ödüllendirir.
-    """
-    teknik = aday.get("teknik") or {}
-    ai = float(aday.get("ai_skoru", 0) or 0)
-    radar = float(aday.get("radar_skoru", 0) or 0)
-    d1 = float(aday.get("degisim1", 0) or 0)
-    d3 = float(aday.get("degisim3", 0) or 0)
-    hacim = float(aday.get("hacim", 0) or 0)
-    btc_fark = float(aday.get("btc_fark3", 0) or 0)
-    lider = float(aday.get("lider_skoru", 0) or 0)
-    rsi = teknik.get("rsi")
-    adx = teknik.get("adx")
-    macd = teknik.get("macd_hist")
-    ema20 = teknik.get("ema20")
-    ema50 = teknik.get("ema50")
-    fiyat = float(aday.get("fiyat", 0) or 0)
-
-    skor = ai * 0.30 + radar * 0.20
-    if ema20 is not None and ema50 is not None and fiyat > 0 and ema20 > ema50 and fiyat > ema20:
-        skor += 12
-    if macd is not None and macd > 0:
-        skor += 8
-    if rsi is not None:
-        if 50 <= rsi <= 68:
-            skor += 10
-        elif 45 <= rsi <= 72:
-            skor += 5
-        elif rsi >= 75:
-            skor -= 12
-    if adx is not None:
-        if adx >= 30:
-            skor += 8
-        elif adx >= 24:
-            skor += 4
-    if 1.4 <= hacim <= 7:
-        skor += min(10, hacim * 1.5)
-    elif hacim > 10 and d3 > 5:
-        skor -= 8
-    if btc_fark >= 1:
-        skor += 5
-    elif btc_fark < -0.5:
-        skor -= 8
-    if lider >= 5:
-        skor += 5
-    if aday.get("erken_aday"):
-        skor += 6
-    if aday.get("hacim_hizlaniyor"):
-        skor += 4
-    if aday.get("momentum_hizlaniyor"):
-        skor += 4
-    if aday.get("basamakli_trend"):
-        skor += 5
-
-    # Geç giriş cezası: güçlü görünse bile kovalamayalım.
-    if d1 >= 4:
-        skor -= 18
-    elif d1 >= 3:
-        skor -= 8
-    if d3 >= 7:
-        skor -= 15
-    elif d3 >= 5:
-        skor -= 7
-    return _clamp100(skor)
-
-
-def birlesik_devam_gucu(aday):
-    """Radar V5.5.1'in devam gücü yaklaşımını kısa ve canlı verilerle özetler."""
-    teknik = aday.get("teknik") or {}
-    d1 = float(aday.get("degisim1", 0) or 0)
-    d3 = float(aday.get("degisim3", 0) or 0)
-    hacim = float(aday.get("hacim", 0) or 0)
-    btc_fark = float(aday.get("btc_fark3", 0) or 0)
-    lider = float(aday.get("lider_skoru", 0) or 0)
-    adx = teknik.get("adx")
-    macd = teknik.get("macd_hist")
-
-    skor = 25
-    if 0.2 <= d1 <= 2.8:
-        skor += 12
-    elif d1 < -0.2:
-        skor -= 18
-    if 0.5 <= d3 <= 5:
-        skor += 12
-    elif d3 > 7:
-        skor -= 8
-    if hacim >= 1.5:
-        skor += min(14, hacim * 2)
-    if aday.get("hacim_hizlaniyor"):
-        skor += 12
-    if aday.get("momentum_hizlaniyor"):
-        skor += 12
-    if aday.get("btc_farki_aciliyor"):
-        skor += 7
-    if aday.get("lider_gucleniyor") or lider >= 5:
-        skor += 7
-    if aday.get("basamakli_trend"):
-        skor += 10
-    if btc_fark >= 0.5:
-        skor += 5
-    if macd is not None and macd > 0:
-        skor += 5
-    if adx is not None and adx >= 25:
-        skor += 5
-    return _clamp100(skor)
-
-
-def birlesik_yaris_skoru(aday):
-    """21B'deki canlı yarış fikri: aynı taramadaki adayları tek puanla sıralar."""
-    giris = birlesik_giris_kalitesi(aday)
-    devam = birlesik_devam_gucu(aday)
-    ai = float(aday.get("ai_skoru", 0) or 0)
-    radar = float(aday.get("radar_skoru", 0) or 0)
-    skor = giris * 0.35 + devam * 0.30 + ai * 0.20 + radar * 0.15
-    if aday.get("erken_aday"):
-        skor += 4
-    return _clamp100(skor)
-
-
-def birlesik_metrikleri_ekle(aday):
-    aday["giris_kalitesi_birlesik"] = birlesik_giris_kalitesi(aday)
-    aday["devam_gucu_birlesik"] = birlesik_devam_gucu(aday)
-    aday["yaris_skoru_birlesik"] = birlesik_yaris_skoru(aday)
-    return aday
-
-def _pct(simdi, baz):
-    return ((simdi / baz) - 1.0) * 100.0 if baz else 0.0
 
 def _takip_yukle():
     global AL_TAKIP
@@ -255,17 +95,106 @@ def _takip_yukle():
                 if isinstance(veri, dict):
                     AL_TAKIP = veri
     except Exception as e:
-        print("[TAKIP] state okunamadı:", e)
-        AL_TAKIP = {}
+        print("Takip dosyasi yuklenemedi:", e)
 
 def _takip_kaydet():
     try:
-        gecici = TAKIP_DOSYASI + ".tmp"
-        with open(gecici, "w", encoding="utf-8") as f:
+        with open(TAKIP_DOSYASI, "w", encoding="utf-8") as f:
             json.dump(AL_TAKIP, f, ensure_ascii=False, indent=2)
-        os.replace(gecici, TAKIP_DOSYASI)
     except Exception as e:
-        print("[TAKIP] state yazılamadı:", e)
+        print("Takip dosyasi kaydedilemedi:", e)
+
+def giris_zamanlamasi_ortak(aday):
+    teknik = aday.get("teknik") or {}
+    mikro = aday.get("mikro") or {}
+    d3m = float(mikro.get("d3", 0) or 0)
+    d5m = float(mikro.get("d5", 0) or 0)
+    d10m = float(mikro.get("d10", 0) or 0)
+    d1s = float(aday.get("degisim1", 0) or 0)
+    rsi = teknik.get("rsi")
+    try:
+        rsi = float(rsi) if rsi is not None else None
+    except Exception:
+        rsi = None
+
+    gec = (
+        d3m >= MIKRO_GEC_3DK
+        or d5m >= MIKRO_GEC_5DK
+        or d10m >= MIKRO_GEC_10DK
+        or d1s >= TREND_GEC_1S
+        or (rsi is not None and rsi >= RSI_GEC and d5m >= 3.0)
+    )
+    if gec:
+        return "GEC"
+
+    erken = (
+        d3m <= 2.8
+        and d5m <= 3.8
+        and d10m <= 5.0
+        and (rsi is None or rsi <= 70)
+    )
+    return "ERKEN" if erken else "DEVAM"
+
+def ortak_kalite_hesapla(aday):
+    teknik = aday.get("teknik") or {}
+    mikro = aday.get("mikro") or {}
+    ema20 = teknik.get("ema20")
+    ema50 = teknik.get("ema50")
+    fiyat = float(aday.get("fiyat", 0) or 0)
+    rsi = teknik.get("rsi")
+    adx = teknik.get("adx")
+    macd_hist = teknik.get("macd_hist")
+
+    try:
+        rsi = float(rsi) if rsi is not None else None
+    except Exception:
+        rsi = None
+    try:
+        adx = float(adx) if adx is not None else None
+    except Exception:
+        adx = None
+
+    ema_ok = (
+        ema20 is not None and ema50 is not None
+        and ema20 > ema50 and fiyat > float(ema20)
+    )
+    macd_ok = macd_hist is not None and macd_hist > 0
+
+    giris = 38.0
+    if ema_ok: giris += 14
+    if macd_ok: giris += 12
+    if rsi is not None and 50 <= rsi <= 68: giris += 12
+    elif rsi is not None and 68 < rsi <= 72: giris += 5
+    elif rsi is not None and rsi > 74: giris -= 12
+    if adx is not None and adx >= 30: giris += 10
+    elif adx is not None and adx >= 25: giris += 6
+    elif adx is not None and adx < 20: giris -= 10
+    if aday.get("basamakli_trend"): giris += 8
+    if aday.get("btc_farki_aciliyor"): giris += 5
+    if aday.get("lider_gucleniyor"): giris += 5
+
+    hacim_ivme = float(mikro.get("hacim3_ivme", 0) or 0)
+    hacim1x = float(mikro.get("hacim1x", 0) or 0)
+    d3m = float(mikro.get("d3", 0) or 0)
+    d5m = float(mikro.get("d5", 0) or 0)
+
+    if hacim_ivme >= 1.15: giris += 8
+    if hacim1x >= 1.20: giris += 5
+    if d3m < 0: giris -= 10
+    if d5m >= 5.0: giris -= 12
+
+    devam = 35.0
+    devam += min(20, max(0, float(aday.get("ai_skoru", 0) or 0) - 70) * 0.5)
+    devam += min(15, max(0, float(aday.get("radar_skoru", 0) or 0) - 55) * 0.35)
+    if adx is not None and adx >= 30: devam += 10
+    if macd_ok: devam += 8
+    if aday.get("btcden_guclu"): devam += 6
+    if aday.get("lider_gucleniyor"): devam += 5
+    if aday.get("momentum_hizlaniyor"): devam += 5
+    if aday.get("hacim_hizlaniyor"): devam += 5
+    if d3m < -0.5: devam -= 12
+
+    return round(max(0, min(giris, 100)), 1), round(max(0, min(devam, 100)), 1)
 
 def al_takip_baslat(aday):
     symbol = aday.get("symbol")
@@ -275,21 +204,21 @@ def al_takip_baslat(aday):
     eski = AL_TAKIP.get(symbol)
     if eski and eski.get("durum") == "ACIK":
         return
+
     AL_TAKIP[symbol] = {
         "durum": "ACIK",
         "giris": fiyat,
+        "son_fiyat": fiyat,
         "max_fiyat": fiyat,
-        "ilk_zaman": time.time(),
+        "baslangic": time.time(),
+        "kademe2": False,
+        "kademe3": False,
         "kar_al1": False,
         "kalan_oran": 100,
-        "son_fiyat": fiyat,
     }
     _takip_kaydet()
 
 def al_takip_guncelle(ticker):
-    """13'ün verdiği AL sinyallerini fiyat bazlı takip eder.
-    Çok mesaj üretmez: yalnızca KÂR AL 1 veya SAT/İPTAL olduğunda Telegram'a yazar.
-    """
     if not AL_TAKIP:
         return
 
@@ -315,8 +244,7 @@ def al_takip_guncelle(ticker):
             continue
 
         giris = float(p.get("giris", fiyat) or fiyat)
-        eski_max = float(p.get("max_fiyat", fiyat) or fiyat)
-        if fiyat > eski_max:
+        if fiyat > float(p.get("max_fiyat", fiyat) or fiyat):
             p["max_fiyat"] = fiyat
         tepe = float(p.get("max_fiyat", fiyat) or fiyat)
         p["son_fiyat"] = fiyat
@@ -324,24 +252,38 @@ def al_takip_guncelle(ticker):
         getiri = _pct(fiyat, giris)
         tepeden = _pct(fiyat, tepe)
 
-        # 1) İlk anlamlı kâr: tamamını satma; bir kısmını koru.
+        # 22 parcali plan: fiyat teyidi geldikce kademe ekle.
+        if not p.get("kademe2") and getiri >= KADEME_2_ESIK:
+            p["kademe2"] = True
+            mesajlar.append(
+                f"🟢 2. KADEME UYGUN - {symbol}\n"
+                f"Fiyat: {fiyat:.4f} | Ilk girise gore: %{getiri:+.2f}\n"
+                f"Plan: +%{KADEME_2_ORAN} kademe; toplam plan %{KADEME_1_ORAN + KADEME_2_ORAN}."
+            )
+            degisti = True
+
+        if p.get("kademe2") and not p.get("kademe3") and getiri >= KADEME_3_ESIK:
+            p["kademe3"] = True
+            mesajlar.append(
+                f"🟢 3. KADEME UYGUN - {symbol}\n"
+                f"Fiyat: {fiyat:.4f} | Ilk girise gore: %{getiri:+.2f}\n"
+                f"Plan: son +%{KADEME_3_ORAN} kademe; tam plan tamamlandi."
+            )
+            degisti = True
+
+        # İlk anlamlı kâr: 21/13 kâr koru.
         if not p.get("kar_al1") and getiri >= KAR_AL_1_ESIK:
             p["kar_al1"] = True
             p["kalan_oran"] = 100 - KAR_AL_1_ORAN
             mesajlar.append(
-                f"🟠 KÂR AL 1 - {symbol}\n"
-                f"Fiyat: {fiyat:.4f} | İlk AL'a göre: %{getiri:+.2f}\n"
-                f"Plan: %{KAR_AL_1_ORAN} kârı koru, %{100-KAR_AL_1_ORAN} taşımaya devam et\n"
-                f"Tepe: {tepe:.4f}\n"
-                f"Kalan bölüm trend bozulana kadar takipte."
+                f"🟠 KÂR KORU - {symbol}\n"
+                f"Fiyat: {fiyat:.4f} | Ilk girise gore: %{getiri:+.2f}\n"
+                f"Plan: %{KAR_AL_1_ORAN} kâri koru, %{100-KAR_AL_1_ORAN} tasimaya devam et\n"
+                f"Tepe: {tepe:.4f}"
             )
             degisti = True
-            continue
 
-        # 2) İlk kâr gelmeden yanlış sinyali büyütme.
         ilk_bozulma = (not p.get("kar_al1")) and getiri <= ILK_ZARAR_KES
-
-        # 3) Kâr alındıktan sonra tepeden geri verme ile kalan kısmı koru.
         karli_bozulma = p.get("kar_al1") and (
             getiri >= MIN_KAR_KORUMA and tepeden <= TEPE_GERI_VERME
         )
@@ -354,17 +296,16 @@ def al_takip_guncelle(ticker):
 
             if p.get("kar_al1"):
                 baslik = "🔴 SAT KALAN"
-                sebep = "kâr sonrası tepeden geri verme"
+                sebep = "kâr sonrasi tepeden geri verme"
             else:
-                baslik = "🔴 AL İPTAL / ÇIK"
-                sebep = "ilk AL doğrulanmadı; zarar sınırı aşıldı"
+                baslik = "🔴 AL IPTAL / ÇIK"
+                sebep = "ilk giris dogrulanmadi; zarar siniri asildi"
 
             mesajlar.append(
                 f"{baslik} - {symbol}\n"
-                f"Fiyat: {fiyat:.4f} | İlk AL'a göre: %{getiri:+.2f}\n"
+                f"Fiyat: {fiyat:.4f} | Ilk girise gore: %{getiri:+.2f}\n"
                 f"Tepe: {tepe:.4f} | Tepeden: %{tepeden:+.2f}\n"
-                f"Sebep: {sebep}\n"
-                f"Yeniden güçlenirse yeni AL olarak tekrar değerlendirilebilir."
+                f"Sebep: {sebep}"
             )
             degisti = True
 
@@ -376,6 +317,9 @@ def al_takip_guncelle(ticker):
         telegram_gonder(mesaj)
 
 _takip_yukle()
+
+
+
 
 
 
@@ -408,13 +352,11 @@ NEGATIF = [
 
 def telegram_gonder(mesaj):
     if not BOT_TOKEN:
-        print("TELEGRAM_BOT_TOKEN bulunamadı. Humanity Railway Variables kontrol et.")
-        return
-    if not CHAT_IDS:
-        print("TELEGRAM_CHAT_ID bulunamadı. Humanity Railway Variables kontrol et.")
-        return
+        print("BOT_TOKEN bulunamadı. Railway Variables kontrol et.")
+        return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    en_az_bir_basarili = False
 
     for chat_id in CHAT_IDS:
         try:
@@ -423,9 +365,20 @@ def telegram_gonder(mesaj):
                 params={"chat_id": chat_id, "text": mesaj},
                 timeout=10
             )
-            print(chat_id, r.text)
+            try:
+                veri = r.json()
+            except Exception:
+                veri = {}
+
+            if r.ok and veri.get("ok") is True:
+                en_az_bir_basarili = True
+                print(f"[TELEGRAM OK] {chat_id}")
+            else:
+                print(f"[TELEGRAM HATA] {chat_id} | HTTP {r.status_code} | {r.text[:300]}")
         except Exception as e:
-            print(chat_id, e)
+            print(f"[TELEGRAM HATA] {chat_id} | {e}")
+
+    return en_az_bir_basarili
 
 
 def veri_getir(symbol, saat=24):
@@ -435,6 +388,102 @@ def veri_getir(symbol, saat=24):
         f"symbol={symbol}&resolution=60&from={simdi - (saat * 3600)}&to={simdi}"
     )
     return requests.get(url, timeout=10).json()
+
+
+def dakika_veri_getir(symbol, dakika=20):
+    """1 dakikalık mumlar. Erken yakalama motorunun ana veri kaynağı."""
+    simdi = int(time.time())
+    url = (
+        f"https://graph-api.btcturk.com/v1/klines/history?"
+        f"symbol={symbol}&resolution=1&from={simdi - (dakika * 60)}&to={simdi}"
+    )
+    r = requests.get(url, timeout=8)
+    r.raise_for_status()
+    return r.json()
+
+
+def _pct_son(c, n):
+    if len(c) <= n or not c[-1-n]:
+        return 0.0
+    return ((c[-1] - c[-1-n]) / c[-1-n]) * 100
+
+
+def mikro_ivme_hesapla(symbol):
+    """
+    1-3-5-10 dk hareket + hacim ivmesi.
+    Amaç: coin %10-20 olduktan sonra değil, henüz %0.5-3 civarında güçlenirken görmek.
+    Veri alınamazsa eski motor çalışmaya devam eder.
+    """
+    try:
+        d = dakika_veri_getir(symbol, 20)
+        o = d.get("o", [])
+        h = d.get("h", [])
+        l = d.get("l", [])
+        c = d.get("c", [])
+        v = d.get("v", [])
+        if len(c) < 12 or len(v) < 12:
+            return None
+
+        d1 = _pct_son(c, 1)
+        d3 = _pct_son(c, 3)
+        d5 = _pct_son(c, 5)
+        d10 = _pct_son(c, 10)
+
+        # Son dakika hacmi önceki 5 dakikanın ortalamasına göre.
+        v_prev5 = sum(v[-6:-1]) / 5 if sum(v[-6:-1]) > 0 else 0
+        hacim1x = (v[-1] / v_prev5) if v_prev5 > 0 else 0
+
+        # Son 3 dk ortalaması, ondan önceki 3 dk ortalamasına göre hızlanıyor mu?
+        son3 = sum(v[-3:]) / 3
+        once3 = sum(v[-6:-3]) / 3
+        hacim3_ivme = (son3 / once3) if once3 > 0 else 0
+
+        # Mikro basamak: son kısa periyotta dipler ve kapanışlar yukarı taşınıyor mu?
+        basamak = False
+        if len(c) >= 6:
+            son_kapanislar = c[-5:]
+            yukselen_kapanis = sum(1 for i in range(1, len(son_kapanislar)) if son_kapanislar[i] >= son_kapanislar[i-1]) >= 3
+            if len(l) >= 5:
+                son_dipler = l[-5:]
+                yukselen_dip = sum(1 for i in range(1, len(son_dipler)) if son_dipler[i] >= son_dipler[i-1]) >= 3
+            else:
+                yukselen_dip = yukselen_kapanis
+            basamak = yukselen_kapanis and yukselen_dip
+
+        # Hız artışı: 1dk temposu 3/5dk ortalama temposundan belirgin yüksek.
+        tempo3 = d3 / 3.0
+        tempo5 = d5 / 5.0
+        fiyat_ivmeleniyor = d1 > 0 and d3 > 0 and (d1 >= tempo3 * 1.15 or tempo3 >= tempo5 * 1.10)
+        hacim_ivmeleniyor = hacim1x >= 1.35 or hacim3_ivme >= 1.25
+
+        # Şişme/kovalama filtresi. 10 dk içinde aşırı kaçmış coin yeni AL için uygun değil.
+        sisti = d10 >= 6.5 or d5 >= 5.0 or d3 >= 4.0
+
+        mikro_skor = 0
+        if d1 >= 0.15: mikro_skor += 10
+        if d1 >= 0.30: mikro_skor += 8
+        if d3 >= 0.45: mikro_skor += 12
+        if d3 >= 0.80: mikro_skor += 8
+        if d5 >= 0.70: mikro_skor += 10
+        if 0.8 <= d10 <= 5.5: mikro_skor += 8
+        if hacim1x >= 1.35: mikro_skor += 12
+        if hacim1x >= 1.80: mikro_skor += 8
+        if hacim3_ivme >= 1.25: mikro_skor += 10
+        if fiyat_ivmeleniyor: mikro_skor += 7
+        if hacim_ivmeleniyor: mikro_skor += 7
+        if basamak: mikro_skor += 10
+        if sisti: mikro_skor -= 30
+        mikro_skor = max(0, min(100, mikro_skor))
+
+        return {
+            "d1": round(d1, 3), "d3": round(d3, 3), "d5": round(d5, 3), "d10": round(d10, 3),
+            "hacim1x": round(hacim1x, 2), "hacim3_ivme": round(hacim3_ivme, 2),
+            "fiyat_ivmeleniyor": fiyat_ivmeleniyor, "hacim_ivmeleniyor": hacim_ivmeleniyor,
+            "mikro_basamak": basamak, "sisti": sisti, "mikro_skor": mikro_skor
+        }
+    except Exception as e:
+        print(f"[MIKRO VERI] {symbol}: {e}")
+        return None
 
 
 
@@ -1002,7 +1051,55 @@ def h_karar_hesapla(aday):
         and skor >= 80
     )
 
-    if normal_al or elit_al or yildiz_istisna or erken_al:
+    # --------------------------------------------------
+    # GEÇ GİRİŞ KONTROLÜ V1
+    # Sadece "Çoklu Güç / Güçleniyor" yolundan gelen coinlerde çalışır.
+    # RED gibi erken yakalamaları etkilemez.
+    #
+    # Tek bir göstergeyle AL kesilmez. Aşağıdaki 5 geç-kalma işaretinden
+    # en az 3'ü aynı anda varsa giriş artık fazla ilerlemiş kabul edilir:
+    #   - RSI >= 70
+    #   - 1s hareket >= %3
+    #   - 3s hareket >= %4
+    #   - fiyat EMA20'den >= 1.5 ATR uzak
+    #   - fiyat son zirveye çok yakın
+    # --------------------------------------------------
+    ema20_uzaklik_yuzde = None
+    ema20_atr_uzaklik = None
+
+    if ema20 is not None and ema20 > 0 and fiyat:
+        ema20_uzaklik_yuzde = ((fiyat - ema20) / ema20) * 100
+
+        if atr_yuzde is not None and atr_yuzde > 0:
+            ema20_atr_uzaklik = ema20_uzaklik_yuzde / atr_yuzde
+
+    gec_giris_isaretleri = 0
+
+    if rsi is not None and rsi >= 70:
+        gec_giris_isaretleri += 1
+
+    if deg1 >= 3:
+        gec_giris_isaretleri += 1
+
+    if deg3 >= 4:
+        gec_giris_isaretleri += 1
+
+    if ema20_atr_uzaklik is not None and ema20_atr_uzaklik >= 1.5:
+        gec_giris_isaretleri += 1
+
+    if aday.get("zirve_yakin", False):
+        gec_giris_isaretleri += 1
+
+    gec_giris = (
+        aday.get("guc_havuzu_adayi", False)
+        and not aday.get("erken_aday", False)
+        and gec_giris_isaretleri >= 3
+    )
+
+    if gec_giris:
+        nedenler.append("Giriş geç: hareket fazla ilerlemiş")
+
+    if (normal_al or elit_al or yildiz_istisna or erken_al) and not gec_giris:
         karar = "🟢 AL"
     elif skor >= 55:
         karar = "🟡 BEKLE"
@@ -1030,10 +1127,231 @@ def h_karar_hesapla(aday):
     }
 
 
+def canli_aday_guncelle(aday, simdi=None):
+    """Bir adayı 3-10 dakikalık sessiz yarış havuzunda günceller."""
+    if simdi is None:
+        simdi = time.time()
+
+    symbol = aday.get("symbol")
+    if not symbol:
+        return
+
+    fiyat = float(aday.get("fiyat", 0) or 0)
+    ai = float(aday.get("ai_skoru", 0) or 0)
+    radar = float(aday.get("radar_skoru", 0) or 0)
+    hacim = float(aday.get("hacim", 0) or 0)
+    deg1 = float(aday.get("degisim1", 0) or 0)
+    deg3 = float(aday.get("degisim3", 0) or 0)
+    mikro = aday.get("mikro") or {}
+    mikro_skor = float(mikro.get("mikro_skor", 0) or 0)
+    d3k = float(mikro.get("d3", 0) or 0)
+    d5k = float(mikro.get("d5", 0) or 0)
+    btc_fark3 = float(aday.get("btc_fark3", 0) or 0)
+    lider = float(aday.get("lider_skoru", 0) or 0)
+
+    kayit = canli_aday_havuzu.get(symbol)
+    if kayit is None:
+        kayit = {
+            "ilk_zaman": simdi,
+            "son_zaman": simdi,
+            "gozlem": 0,
+            "ilk_fiyat": fiyat,
+            "tepe_fiyat": fiyat,
+            "ilk_ai": ai,
+            "son_ai": ai,
+            "ilk_hacim": hacim,
+            "son_hacim": hacim,
+            "ilk_deg3": deg3,
+            "son_deg3": deg3,
+            "en_iyi_yaris": 0,
+        }
+        canli_aday_havuzu[symbol] = kayit
+
+    kayit["son_zaman"] = simdi
+    kayit["gozlem"] = int(kayit.get("gozlem", 0)) + 1
+    kayit["tepe_fiyat"] = max(float(kayit.get("tepe_fiyat", fiyat) or fiyat), fiyat)
+
+    onceki_ai = float(kayit.get("son_ai", ai) or ai)
+    onceki_hacim = float(kayit.get("son_hacim", hacim) or hacim)
+    onceki_deg3 = float(kayit.get("son_deg3", deg3) or deg3)
+
+    ai_ivme = ai - onceki_ai
+    hacim_ivme = hacim - onceki_hacim
+    momentum_ivme = deg3 - onceki_deg3
+    tepe = float(kayit.get("tepe_fiyat", fiyat) or fiyat)
+    tepe_geri = ((fiyat / tepe) - 1.0) * 100 if tepe > 0 else 0.0
+
+    # 0-100 yarış skoru: final AL skoru değil, adaylar arası canlı göreli güç sıralamasıdır.
+    yaris = 0.0
+    yaris += min(ai, 100) * 0.38
+    yaris += min(radar, 100) * 0.20
+    yaris += min(max(lider, 0), 10) * 1.6
+    yaris += min(max(btc_fark3, -2), 6) * 2.0
+    yaris += min(max(deg3, 0), 8) * 1.5
+    yaris += min(max(hacim, 0), 10) * 0.5
+    # V21C: canlı yarışta kısa vade ana ağırlık.
+    yaris += mikro_skor * 0.22
+    yaris += min(max(d3k, 0), 3) * 2.0
+    yaris += min(max(d5k, 0), 4) * 1.0
+    if mikro.get("fiyat_ivmeleniyor"):
+        yaris += 5
+    if mikro.get("hacim_ivmeleniyor"):
+        yaris += 5
+    if mikro.get("mikro_basamak"):
+        yaris += 5
+    if mikro.get("sisti"):
+        yaris -= 22
+
+    if ai_ivme >= 2:
+        yaris += 5
+    elif ai_ivme < -3:
+        yaris -= 7
+
+    if hacim_ivme >= 0.5:
+        yaris += 4
+    elif hacim_ivme < -1.0:
+        yaris -= 4
+
+    if momentum_ivme >= 0.25:
+        yaris += 4
+    elif momentum_ivme < -0.35:
+        yaris -= 5
+
+    if aday.get("basamakli_trend"):
+        yaris += 5
+    if aday.get("btcden_guclu"):
+        yaris += 4
+    if aday.get("dinamik_teyit_sayisi", 0) >= 3:
+        yaris += 4
+
+    # Tepe sonrası sert geri verme, mesaj anında yakalanan 'pump sonu' riskini düşürür.
+    if tepe_geri <= -2.0:
+        yaris -= 12
+    elif tepe_geri <= -1.0:
+        yaris -= 6
+
+    # Son saat mumu negatife dönmüşse canlı liderlik puanı kırılır.
+    if deg1 < 0:
+        yaris -= 6
+
+    yaris = round(max(0, min(yaris, 100)), 1)
+
+    kayit["son_ai"] = ai
+    kayit["son_hacim"] = hacim
+    kayit["son_deg3"] = deg3
+    kayit["son_yaris"] = yaris
+    kayit["en_iyi_yaris"] = max(float(kayit.get("en_iyi_yaris", 0) or 0), yaris)
+    kayit["tepe_geri"] = round(tepe_geri, 2)
+    kayit["son_aday"] = aday
+
+
+def canli_havuzu_temizle(simdi=None):
+    if simdi is None:
+        simdi = time.time()
+    for symbol, kayit in list(canli_aday_havuzu.items()):
+        ilk = float(kayit.get("ilk_zaman", simdi) or simdi)
+        son = float(kayit.get("son_zaman", simdi) or simdi)
+        if simdi - ilk > CANLI_MAX_BEKLEME or simdi - son > 3 * 60:
+            canli_aday_havuzu.pop(symbol, None)
+
+
+def canli_kazananlari_bul(btc_3s, simdi=None):
+    """Sadece olgunlaşmış, hâlâ AL olan ve yarışta üstte kalan en fazla 2 coini döndürür."""
+    if simdi is None:
+        simdi = time.time()
+
+    if btc_3s <= BTC_SERT_ZAYIFLIK_ESIGI:
+        print(f"[CANLI YARIŞ] BTC 3s %{btc_3s:.2f}: sert zayıflık, yeni AL kapalı.")
+        return []
+
+    uygun = []
+    for symbol, kayit in canli_aday_havuzu.items():
+        aday = kayit.get("son_aday") or {}
+        yas = simdi - float(kayit.get("ilk_zaman", simdi) or simdi)
+        gozlem = int(kayit.get("gozlem", 0) or 0)
+        yaris = float(kayit.get("son_yaris", 0) or 0)
+        tepe_geri = float(kayit.get("tepe_geri", 0) or 0)
+
+        if yas < CANLI_MIN_BEKLEME:
+            continue
+        if gozlem < CANLI_MIN_GOZLEM:
+            continue
+        # V21B: canlı yarış artık gerçekten final karar katmanı.
+        # Eski AL kapısını geçen coin doğrudan yarışabilir.
+        # Eski motor BEKLE dese bile teknik yapı temiz + yarış çok güçlüyse
+        # final AL üretilebilir. Böylece iki sıkı kapının üst üste binmesi önlenir.
+        eski_al = "🟢 AL" in str(aday.get("karar", ""))
+        teknik = aday.get("teknik") or {}
+        ema20 = teknik.get("ema20")
+        ema50 = teknik.get("ema50")
+        rsi = teknik.get("rsi")
+        macd_hist = teknik.get("macd_hist")
+        adx = teknik.get("adx")
+        fiyat = float(aday.get("fiyat", 0) or 0)
+        ai = float(aday.get("ai_skoru", 0) or 0)
+        radar = float(aday.get("radar_skoru", 0) or 0)
+        deg3 = float(aday.get("degisim3", 0) or 0)
+        btc_fark3 = float(aday.get("btc_fark3", 0) or 0)
+        nedenler = aday.get("nedenler") or []
+        mikro = aday.get("mikro") or {}
+        mikro_skor = float(mikro.get("mikro_skor", 0) or 0)
+
+        teknik_temiz = (
+            ema20 is not None and ema50 is not None
+            and fiyat > 0 and ema20 > ema50 and fiyat > ema20
+            and rsi is not None and 47 <= rsi <= 74
+            and macd_hist is not None and macd_hist > 0
+            and adx is not None and adx >= 24
+        )
+        yaris_al = (
+            not eski_al
+            and teknik_temiz
+            and ai >= 72
+            and radar >= 48
+            and yaris >= 70
+            and btc_fark3 >= -0.2
+            and not any("Giriş geç" in str(x) for x in nedenler)
+        )
+
+        # V21C kısa-vade AL yolu: eski 1s/3s hareketin büyümesini beklemez.
+        # Coin henüz şişmeden 1-3-5-10dk ivmesi + hacim + mikro basamak ile öne çıkabilir.
+        mikro_al = (
+            not eski_al
+            and mikro_skor >= 68
+            and not mikro.get("sisti", False)
+            and float(mikro.get("d3", 0) or 0) >= 0.35
+            and float(mikro.get("d5", 0) or 0) >= 0.55
+            and (mikro.get("hacim_ivmeleniyor") or float(mikro.get("hacim1x", 0) or 0) >= 1.5)
+            and (mikro.get("fiyat_ivmeleniyor") or mikro.get("mikro_basamak"))
+            and ai >= 66
+            and radar >= 40
+            and yaris >= 68
+            and btc_fark3 >= -0.5
+            and not any("Giriş geç" in str(x) for x in nedenler)
+        )
+
+        if mikro.get("sisti", False):
+            continue
+        if not (eski_al or yaris_al or mikro_al):
+            continue
+        if yaris < CANLI_MIN_YARIS_SKORU:
+            continue
+        if tepe_geri <= -2.0:
+            continue
+        if float(aday.get("degisim1", 0) or 0) < 0:
+            continue
+
+        aday["canli_final_tipi"] = "ESKI_AL" if eski_al else ("MIKRO_AL" if mikro_al else "YARIS_AL")
+        uygun.append((yaris, ai, symbol, aday, kayit))
+
+    uygun.sort(reverse=True, key=lambda x: (x[0], x[1]))
+    return uygun[:CANLI_MAX_KAZANAN]
+
+
 while True:
     try:
         print()
-        print("BIRLESIK 4 BOT - V1 | ERKEN + KALITE + YARIS + AL/SAT")
+        print("AI COIN ASSISTANT - V21C ORTAK V1 | ERKEN + PARCALI + KAR KORU")
         print("--------------------------------")
 
         btc_d = btc_degisimleri()
@@ -1054,7 +1372,7 @@ while True:
         ticker_response.raise_for_status()
         ticker = ticker_response.json().get("data", [])
 
-        # Daha önce AL verilmiş coinleri her 60 sn bağımsız takip et.
+        # Acik AL sinyallerini her 60 sn yonet.
         al_takip_guncelle(ticker)
 
         adaylar = []
@@ -1129,6 +1447,10 @@ while True:
                     continue
 
                 hacim_kat = son_hacim / ort_hacim
+
+                # V21C: 1-3-5-10 dakikalık erken hareket motoru.
+                mikro = mikro_ivme_hesapla(symbol) or {}
+                mikro_skor = float(mikro.get("mikro_skor", 0) or 0)
 
                 btc_guc_skoru, btc_fark1, btc_fark3, btc_fark24 = btc_gucu_v2_hesapla(
                     degisim1, degisim3, degisim24, btc_d
@@ -1304,14 +1626,30 @@ while True:
                     and btc_fark3 >= -0.5
                     and (
                         (
-                            dinamik_teyit_sayisi >= 2
+                            dinamik_teyit_sayisi >= 3
                             and (hacim_hizlaniyor or momentum_hizlaniyor)
                         )
-                        or basamakli_trend
+                        or (
+                            basamakli_trend
+                            and dinamik_teyit_sayisi >= 1
+                        )
                     )
                 )
 
-                if erken_aday or guc_havuzu_adayi:
+                # V21C: Ana erken aday yolu. 1 saatlik hareketin büyümesini beklemez.
+                mikro_aday = (
+                    bool(mikro)
+                    and not mikro.get("sisti", False)
+                    and mikro_skor >= 48
+                    and float(mikro.get("d3", 0) or 0) >= 0.20
+                    and float(mikro.get("d5", 0) or 0) >= 0.30
+                    and (mikro.get("fiyat_ivmeleniyor") or mikro.get("mikro_basamak"))
+                    and (mikro.get("hacim_ivmeleniyor") or float(mikro.get("hacim1x", 0) or 0) >= 1.30)
+                    and btc_fark3 >= -1.0
+                    and not satis_baskisi
+                )
+
+                if erken_aday or guc_havuzu_adayi or mikro_aday:
                     guc_izleme_havuzu[symbol] = time.time() + GUC_IZLEME_SURESI
 
                 yildiz_adayi = (
@@ -1356,7 +1694,7 @@ while True:
                     and (haber_skoru > 0 or lider_skoru >= 5)
                 )
 
-                if not (erken_aday or guc_havuzu_adayi or yildiz_adayi or elit_adayi or trader_adayi or roket_adayi):
+                if not (mikro_aday or erken_aday or guc_havuzu_adayi or yildiz_adayi or elit_adayi or trader_adayi or roket_adayi):
                     continue
 
                 if yildiz_adayi:
@@ -1367,6 +1705,8 @@ while True:
                     radar_kategori = "📊 Trader Hacim"
                 elif roket_adayi:
                     radar_kategori = "🚀 Roket Adayı"
+                elif mikro_aday:
+                    radar_kategori = "🌱 Mikro Güçleniyor"
                 elif erken_aday:
                     radar_kategori = "🌱 Erken Aday"
                 else:
@@ -1378,6 +1718,8 @@ while True:
                     "radar_skoru": radar_skoru,
                     "radar_kategori": radar_kategori,
                     "erken_aday": erken_aday,
+                    "mikro_aday": mikro_aday,
+                    "mikro": mikro,
                     "guc_havuzu_adayi": guc_havuzu_adayi,
                     "basamakli_trend": basamakli_trend,
                     "dinamik_teyit_sayisi": dinamik_teyit_sayisi,
@@ -1420,7 +1762,7 @@ while True:
                 x.get("radar_skoru", 0),
             ),
             reverse=True
-        )[:10]
+        )[:6]
 
         # Aynı coin iki listede varsa tek kez analiz edilir.
         top10 = []
@@ -1443,7 +1785,12 @@ while True:
             a["teknik"] = teknik
             karar = h_karar_hesapla(a)
             a.update(karar)
-            birlesik_metrikleri_ekle(a)
+
+            # ORTAK V1: 21C erkenlik + 13 gec filtre + kalite/devam puani.
+            a["giris_turu_ortak"] = giris_zamanlamasi_ortak(a)
+            giris_k, devam_g = ortak_kalite_hesapla(a)
+            a["giris_kalitesi_ortak"] = giris_k
+            a["devam_gucu_ortak"] = devam_g
 
             # --------------------------------------------------
             # AL DEBUG LOG
@@ -1511,73 +1858,91 @@ while True:
                     f"Teknik veri alınamadı"
                 )
 
+        # V21: teknik analizden geçen bütün adaylar sessiz canlı yarış havuzuna yazılır.
+        simdi_yaris = time.time()
+        for a in top10:
+            symbol = a.get("symbol")
+            # V21B: tekrar mesaj kilidini eski BEKLE/AL kararına göre açma.
+            # Canlı yarış artık final karar katmanı olduğu için aynı coin gereksiz tekrar etmez.
+            canli_aday_guncelle(a, simdi_yaris)
+        canli_havuzu_temizle(simdi_yaris)
+
+        if canli_aday_havuzu:
+            sirali_havuz = sorted(
+                canli_aday_havuzu.items(),
+                key=lambda kv: float(kv[1].get("son_yaris", 0) or 0),
+                reverse=True
+            )
+            ozet = ", ".join(
+                f"{sym}:{kayit.get('son_yaris', 0)}"
+                for sym, kayit in sirali_havuz[:6]
+            )
+            print(f"[CANLI YARIŞ] Havuz: {ozet}")
+
         # İlk aday sıralamasını Radar yapar; H motorundan sonra en güçlü teknik fırsat üste çıkar.
-        # 4 bot tek yarış: önce birleşik skor, sonra giriş kalitesi ve AI.
         top10.sort(
-            key=lambda x: (
-                x.get("yaris_skoru_birlesik", 0),
-                x.get("giris_kalitesi_birlesik", 0),
-                x.get("ai_skoru", 0),
-            ),
+            key=lambda x: (x.get("ai_skoru", 0), x.get("radar_skoru", 0)),
             reverse=True
         )
 
         if not top10:
             print("Şu an uygun aday yok.")
         else:
+            # V21: AL kararı tek başına mesaj değildir. Önce canlı yarışta 3-10 dk olgunlaşır.
+            kazananlar = canli_kazananlari_bul(btc, time.time())
             gonderilecekler = []
 
-            for a in top10:
-                symbol = a["symbol"]
-                karar = a.get("karar", "🟡 BEKLE")
+            for sira, (yaris_skoru, _ai, symbol, a, kayit) in enumerate(kazananlar, start=1):
                 onceki_karar = son_ai_kararlar.get(symbol)
-                son_ai_kararlar[symbol] = karar
 
-                # Telegram yalnızca gerçek AL kararlarında konuşur.
-                # BEKLE ve SAT/PAS arka planda/loglarda izlenmeye devam eder.
-                if "🟢 AL" not in karar:
+                # Aynı gerçek gönderimi yeniden yollama.
+                if onceki_karar == "GONDERILDI":
                     continue
 
-                # Aynı AL kararını tekrar gönderme.
-                if onceki_karar == karar:
+                a["yaris_skoru"] = yaris_skoru
+                a["yaris_sirasi"] = sira
+                a["yaris_suresi_dk"] = round((time.time() - kayit.get("ilk_zaman", time.time())) / 60, 1)
+                a["yaris_gozlem"] = kayit.get("gozlem", 0)
+
+                # FINAL ORTAK KAPI:
+                # 21C yarışı kazanmış + geç kalmamış + teknik/kalite/devam yeterli.
+                gec = a.get("giris_turu_ortak") == "GEC"
+                ai_ok = float(a.get("ai_skoru", 0) or 0) >= 80
+                giris_ok = float(a.get("giris_kalitesi_ortak", 0) or 0) >= 70
+                devam_ok = float(a.get("devam_gucu_ortak", 0) or 0) >= 60
+
+                if gec or not (ai_ok and giris_ok and devam_ok):
+                    print(
+                        f"[ORTAK FILTRE] {symbol} elendi | "
+                        f"gec={gec} | AI={a.get('ai_skoru')} | "
+                        f"Giris={a.get('giris_kalitesi_ortak')} | "
+                        f"Devam={a.get('devam_gucu_ortak')} | Yaris={yaris_skoru}"
+                    )
                     continue
 
-                giris_turu, giris_etiketi = giris_zamanlamasi(a)
-
-                # Geç / şişmiş sinyaller Telegram'a hiç gönderilmez.
-                # Bunlar yeni pozisyon olarak da AL/SAT takibine alınmaz.
-                if giris_turu == "GEC":
-                    print(f"[AL DEBUG] {symbol} | geç giriş filtresi -> Telegram sessiz")
-                    continue
-
-                a["giris_turu"] = giris_turu
-                a["giris_etiketi"] = giris_etiketi
-
-                # Dört botun ortak final kapısı. Erken sinyale biraz esneklik,
-                # devam sinyaline daha yüksek giriş kalitesi ister.
-                gk = float(a.get("giris_kalitesi_birlesik", 0) or 0)
-                dg = float(a.get("devam_gucu_birlesik", 0) or 0)
-                ys = float(a.get("yaris_skoru_birlesik", 0) or 0)
-                erken_esnek = giris_turu == "ERKEN" and gk >= 64 and dg >= 50 and ys >= 67
-                normal_onay = gk >= BIRLESIK_MIN_GIRIS and dg >= BIRLESIK_MIN_DEVAM and ys >= BIRLESIK_MIN_SKOR
-                if not (erken_esnek or normal_onay):
-                    print(f"[BIRLESIK] {symbol} elendi | Giriş={gk} Devam={dg} Yarış={ys}")
-                    continue
+                if (
+                    float(a.get("giris_kalitesi_ortak", 0) or 0) >= 90
+                    and float(a.get("devam_gucu_ortak", 0) or 0) >= 75
+                    and float(a.get("ai_skoru", 0) or 0) >= 85
+                ):
+                    a["final_etiket"] = "🟢 ÇOK GÜÇLÜ AL"
+                elif (
+                    float(a.get("giris_kalitesi_ortak", 0) or 0) >= 80
+                    and float(a.get("devam_gucu_ortak", 0) or 0) >= 70
+                ):
+                    a["final_etiket"] = "🟢 GÜÇLÜ AL"
+                elif a.get("giris_turu_ortak") == "ERKEN":
+                    a["final_etiket"] = "🌱 ERKEN AL"
+                else:
+                    a["final_etiket"] = "🟢 AL"
 
                 gonderilecekler.append(a)
 
-            # Aynı anda mesaj yağmurunu önle: yalnızca yarışın en iyi adayları.
-            gonderilecekler.sort(
-                key=lambda x: (x.get("yaris_skoru_birlesik", 0), x.get("giris_kalitesi_birlesik", 0)),
-                reverse=True
-            )
-            gonderilecekler = gonderilecekler[:BIRLESIK_MAX_MESAJ]
-
             if not gonderilecekler:
-                print("Yeni birleşik AL kararı yok. Telegram sessiz.")
+                print("Canlı yarışta olgunlaşmış yeni AL kazananı yok. Telegram sessiz.")
             else:
                 mesaj = (
-                    "🧠 BİRLEŞİK COIN ASİSTANI - TEK KARAR\n"
+                    "🟢 AL - CANLI YARIŞ KAZANANI\n"
                     f"BTC 3s: %{round(btc, 2)}\n\n"
                 )
 
@@ -1606,42 +1971,39 @@ while True:
                         baslik = "Erken yakalama" if a.get("erken_aday") else "Hareket teyidi"
                         nedenler.insert(0, baslik + ": " + ", ".join(hizlar))
 
-                    # 6+ gerçek olumlu neden varsa yalnızca Neden başına alarm koy.
+                    # 7+ gerçek olumlu neden varsa yalnızca Neden başına alarm koy.
                     # AL kararı veya filtrelerde hiçbir etkisi yok.
                     toplam_neden_sayisi = len(a.get("nedenler", [])) + len(hizlar)
-                    neden_alarm = "🚨 🚨 " if toplam_neden_sayisi >= 6 else ""
+                    neden_alarm = "🚨 🚨 " if toplam_neden_sayisi >= 7 else ""
                     neden = " • ".join(nedenler[:5])
-
-                    giris_etiketi = a.get("giris_etiketi", "🟢 DEVAM AL")
-                    gec_mi = a.get("giris_turu") == "GEC"
-                    plan_satiri = (
-                        "📌 Plan: YENİ GİRİŞ YOK — hareket fazla ilerlemiş\n"
-                        if gec_mi
-                        else f"📌 Plan: ilk giriş max %33 | Kâr Al 1: +%{KAR_AL_1_ESIK:.1f} | Zarar sınırı: %{ILK_ZARAR_KES:.1f}\n"
-                    )
 
                     mesaj += (
                         f"{a['symbol']} | {a.get('radar_kategori', '')}\n"
-                        f"{giris_etiketi} | AI Skoru: {a.get('ai_skoru', 0)}/100 | Risk: {a.get('risk', 'Bilinmiyor')}\n"
-                        f"{plan_satiri}"
-                        f"🎯 Giriş Kalitesi: {a.get('giris_kalitesi_birlesik', 0)}/100 | "
-                        f"🚀 Devam Gücü: {a.get('devam_gucu_birlesik', 0)}/100 | "
-                        f"🏁 Yarış: {a.get('yaris_skoru_birlesik', 0)}/100\n"
+                        f"{a.get('final_etiket', '🟢 GÜÇLÜ AL')} | AI: {a.get('ai_skoru', 0)}/100 | Risk: {a.get('risk', 'Bilinmiyor')}\n"
+                        f"📌 Plan: %{KADEME_1_ORAN} ilk kademe | +%{KADEME_2_ORAN} teyit | +%{KADEME_3_ORAN} güçlü devam\n"
+                        f"🎯 Giriş Kalitesi: {a.get('giris_kalitesi_ortak', 0)}/100 | 🚀 Devam Gücü: {a.get('devam_gucu_ortak', 0)}/100\n"
                         f"Radar: {a['radar_skoru']}/100 | Fiyat: {round(a['fiyat'], 4)} | Hacim: {a['hacim']}x\n"
-                        f"1s: %{a['degisim1']} | 3s: %{a['degisim3']} | 24s: %{a['degisim24']}\n"
+                        f"1dk: %{(a.get('mikro') or {}).get('d1', 0)} | 3dk: %{(a.get('mikro') or {}).get('d3', 0)} | 5dk: %{(a.get('mikro') or {}).get('d5', 0)} | 10dk: %{(a.get('mikro') or {}).get('d10', 0)}\n"
+                        f"Hacim 1dk: {(a.get('mikro') or {}).get('hacim1x', 0)}x | Hacim ivme: {(a.get('mikro') or {}).get('hacim3_ivme', 0)}x\n"
+                        f"1s trend: %{a['degisim1']} | 3s trend: %{a['degisim3']}\n"
+                        f"Yarış: #{a.get('yaris_sirasi', '?')} | Güç: {a.get('yaris_skoru', 0)}/100 | İzleme: {a.get('yaris_suresi_dk', 0)} dk | Gözlem: {a.get('yaris_gozlem', 0)}\n"
                         f"EMA: {ema_yon} | RSI: {teknik['rsi']} | ADX: {teknik['adx']}\n"
                         f"MACD: {macd_yon} | ATR: %{teknik['atr_yuzde']}\n"
                         f"{neden_alarm}Neden: {neden}\n\n"
                     )
 
-                # Yalnızca gerçekten yeni giriş yapılabilir sinyalleri AL/SAT takibine al.
-                # GEÇ / ALMA mesajı bilgi amaçlıdır; pozisyon açılmış sayılmaz.
-                for _aday in gonderilecekler:
-                    if _aday.get("giris_turu") != "GEC":
-                        al_takip_baslat(_aday)
-
                 print(mesaj)
-                telegram_gonder(mesaj)
+                telegram_basarili = telegram_gonder(mesaj)
+
+                # Mesaj gerçekten Telegram'a ulaştıysa pozisyonu açılmış say.
+                # Token/chat sorunu varsa bir sonraki taramada yeniden denensin.
+                if telegram_basarili:
+                    for _aday in gonderilecekler:
+                        al_takip_baslat(_aday)
+                        son_ai_kararlar[_aday["symbol"]] = "GONDERILDI"
+                    print("Ortak AL mesajı Telegram'a başarıyla gönderildi.")
+                else:
+                    print("Ortak AL bulundu fakat Telegram gönderilemedi; sonraki taramada tekrar denenecek.")
 
         print("60 sn bekleniyor...")
         time.sleep(TARAMA_SURESI)
