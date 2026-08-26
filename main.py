@@ -1,5 +1,5 @@
 # ==========================================
-# AI COIN ASSISTANT - 13 TABANLI BIRLESIK V1 | 13 KARAR + 21C ERKENLIK + RADAR KALITE
+# AI COIN ASSISTANT - 13 TABANLI BIRLESIK V3 | SIKI ILK AL + HIZLI TAKIP
 # Taban: main_20_coklu_guc_siklastirilmis.py
 # Fast Scan V1: 60 sn hızlı ön tarama + 5 dk tam tarama
 # AL Relax V1: normal AL için ADX 27 / AI 80
@@ -71,6 +71,7 @@ SON_ANALIZ = {}
 
 # 21 kar-koru / 13 AL-SAT
 KAR_AL_1_ESIK = 3.0
+POZISYON_TAKIP_SURESI = 15     # Açık AL pozisyonlarını 15 sn'de bir kontrol et
 KAR_AL_1_ORAN = 40
 ILK_ZARAR_KES = -1.50
 TEPE_GERI_VERME = -1.40
@@ -1419,7 +1420,7 @@ def canli_kazananlari_bul(btc_3s, simdi=None):
 while True:
     try:
         print()
-        print("AI COIN ASSISTANT - 13 TABANLI BIRLESIK V1 | 13 KARAR + 21C ERKENLIK + RADAR KALITE")
+        print("AI COIN ASSISTANT - 13 TABANLI BIRLESIK V3 | SIKI ILK AL + HIZLI TAKIP")
         print("--------------------------------")
 
         btc_d = btc_degisimleri()
@@ -2044,8 +2045,14 @@ while True:
                     continue
 
                 # Radar tarafı ancak ikisi birden çok zayıfsa veto eder.
-                if giris_k < 65 and devam_g < 60:
-                    print(f"[13 + RADAR VETO] {symbol} | Giris={giris_k} Devam={devam_g}")
+                # SIKI ILK AL:
+                # 13 AL demesi zorunlu; ayrıca ilk giriş kalitesi ve devam gücü
+                # ikisi de minimum seviyeyi geçmeli.
+                if giris_k < 75 or devam_g < 68:
+                    print(
+                        f"[SIKI ILK AL] {symbol} 13=AL ama kalite yetersiz | "
+                        f"Giris={giris_k} (min 75) | Devam={devam_g} (min 68)"
+                    )
                     continue
 
                 # Etiketler sadece kaliteyi anlatır; AL kararını 13 vermiştir.
@@ -2108,7 +2115,8 @@ while True:
                         f"AI: {a.get('ai_skoru', 0)}/100 | Radar: {a.get('radar_skoru', 0)}/100\n"
                         f"🎯 Giriş: {a.get('giris_kalitesi_ortak', 0)}/100 | 🚀 Devam: {a.get('devam_gucu_ortak', 0)}/100\n"
                         f"🏁 21C Yarış: #{a.get('yaris_sirasi', '?')} | Güç: {a.get('yaris_skoru', 0)}/100\n"
-                        f"✅ Ana karar: 13 AL | Diğerleri: kalite/veto\n\n"
+                        f"✅ Ana karar: 13 AL | İlk AL: Giriş≥75 + Devam≥68\n"
+                        f"🛡️ Diğerleri: kalite/veto\n\n"
 
                         f"📈 Hareket\n"
                         f"1dk: %{(a.get('mikro') or {}).get('d1', 0)} | 3dk: %{(a.get('mikro') or {}).get('d3', 0)} | "
@@ -2141,8 +2149,26 @@ while True:
                 else:
                     print("Ortak AL bulundu fakat Telegram gönderilemedi; sonraki taramada tekrar denenecek.")
 
-        print("60 sn bekleniyor...")
-        time.sleep(TARAMA_SURESI)
+        print("60 sn sonraki piyasa taramasına kadar açık pozisyonlar 15 sn'de bir izlenecek...")
+
+        # Genel piyasa taraması 60 sn kalır.
+        # Açık pozisyonlar ise zarar/kâr koruma için daha sık kontrol edilir.
+        beklenen = 0
+        while beklenen < TARAMA_SURESI:
+            time.sleep(min(POZISYON_TAKIP_SURESI, TARAMA_SURESI - beklenen))
+            beklenen += min(POZISYON_TAKIP_SURESI, TARAMA_SURESI - beklenen)
+
+            if AL_TAKIP:
+                try:
+                    takip_resp = requests.get(
+                        "https://api.btcturk.com/api/v2/ticker",
+                        timeout=10
+                    )
+                    takip_resp.raise_for_status()
+                    takip_ticker = takip_resp.json().get("data", [])
+                    al_takip_guncelle(takip_ticker)
+                except Exception as e:
+                    print("Hızlı pozisyon takip hatası:", e)
 
     except Exception as e:
         print("Bot genel hata:", e)
