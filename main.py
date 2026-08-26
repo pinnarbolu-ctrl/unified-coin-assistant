@@ -1,5 +1,5 @@
 # ==========================================
-# AI COIN ASSISTANT - V21C ORTAK V2 ORTA-SIKI | ERKEN + PARCALI + KAR KORU
+# AI COIN ASSISTANT - V21C ORTAK V3 | ORTA-SIKI + TEYITLI KADEME | ERKEN + PARCALI + KAR KORU
 # Taban: main_20_coklu_guc_siklastirilmis.py
 # Fast Scan V1: 60 sn hızlı ön tarama + 5 dk tam tarama
 # AL Relax V1: normal AL için ADX 27 / AI 80
@@ -60,6 +60,14 @@ KADEME_2_ORAN = 30
 KADEME_3_ORAN = 40
 KADEME_2_ESIK = 0.80   # ilk girise gore +%0.8
 KADEME_3_ESIK = 1.80   # ilk girise gore +%1.8
+KADEME_2_MIN_BEKLE = 60       # ilk AL'dan sonra en az 60 sn
+KADEME_3_MIN_BEKLE = 60       # 2. kademeden sonra en az 60 sn
+KADEME_ANALIZ_MAX_YAS = 180   # teyit için analiz en fazla 3 dk eski olabilir
+KADEME_MAX_TEPE_GERI = -1.00  # sert geri vermede yeni kademe ekleme
+
+# Her coin için son teknik/mikro analiz özeti.
+# Pozisyon takibi bir sonraki 60 sn taramada bunu teyit olarak kullanır.
+SON_ANALIZ = {}
 
 # 21 kar-koru / 13 AL-SAT
 KAR_AL_1_ESIK = 3.0
@@ -213,10 +221,68 @@ def al_takip_baslat(aday):
         "baslangic": time.time(),
         "kademe2": False,
         "kademe3": False,
+        "kademe2_zaman": None,
+        "kademe3_zaman": None,
         "kar_al1": False,
         "kalan_oran": 100,
     }
     _takip_kaydet()
+
+def kademe_teyidi(symbol, kademe_no, fiyat, giris, tepe):
+    """Yeni kademe için yalnız fiyat değil, son teknik/mikro kaliteyi de kontrol eder."""
+    snap = SON_ANALIZ.get(symbol) or {}
+    simdi = time.time()
+
+    # Analiz çok eskiyse yeni kademe yok.
+    analiz_zaman = float(snap.get("zaman", 0) or 0)
+    if analiz_zaman <= 0 or (simdi - analiz_zaman) > KADEME_ANALIZ_MAX_YAS:
+        return False, "güncel analiz yok"
+
+    giris_k = float(snap.get("giris_kalitesi", 0) or 0)
+    devam_g = float(snap.get("devam_gucu", 0) or 0)
+    rsi = float(snap.get("rsi", 999) or 999)
+    adx = float(snap.get("adx", 0) or 0)
+    macd_ok = bool(snap.get("macd_ok"))
+    ema_ok = bool(snap.get("ema_ok"))
+    d3 = float(snap.get("d3", 0) or 0)
+    d5 = float(snap.get("d5", 0) or 0)
+    hacim1x = float(snap.get("hacim1x", 0) or 0)
+    hacim_ivme = float(snap.get("hacim_ivme", 0) or 0)
+
+    tepeden = _pct(fiyat, tepe)
+    if tepeden <= KADEME_MAX_TEPE_GERI:
+        return False, "tepeden sert geri verme"
+    if not (ema_ok and macd_ok):
+        return False, "EMA/MACD teyidi yok"
+
+    if kademe_no == 2:
+        ok = (
+            giris_k >= 72
+            and devam_g >= 68
+            and adx >= 24
+            and rsi <= 74
+            and d3 >= 0
+            and (hacim1x >= 0.70 or hacim_ivme >= 0.90)
+        )
+        return ok, (
+            f"Giriş {giris_k:.0f} | Devam {devam_g:.0f} | "
+            f"RSI {rsi:.1f} | ADX {adx:.1f}"
+        )
+
+    ok = (
+        giris_k >= 75
+        and devam_g >= 72
+        and adx >= 26
+        and rsi <= 72
+        and d3 >= 0
+        and d5 >= 0
+        and (hacim1x >= 0.90 or hacim_ivme >= 1.00)
+    )
+    return ok, (
+        f"Giriş {giris_k:.0f} | Devam {devam_g:.0f} | "
+        f"RSI {rsi:.1f} | ADX {adx:.1f}"
+    )
+
 
 def al_takip_guncelle(ticker):
     if not AL_TAKIP:
@@ -252,24 +318,49 @@ def al_takip_guncelle(ticker):
         getiri = _pct(fiyat, giris)
         tepeden = _pct(fiyat, tepe)
 
-        # 22 parcali plan: fiyat teyidi geldikce kademe ekle.
-        if not p.get("kademe2") and getiri >= KADEME_2_ESIK:
-            p["kademe2"] = True
-            mesajlar.append(
-                f"🟢 2. KADEME UYGUN - {symbol}\n"
-                f"Fiyat: {fiyat:.4f} | Ilk girise gore: %{getiri:+.2f}\n"
-                f"Plan: +%{KADEME_2_ORAN} kademe; toplam plan %{KADEME_1_ORAN + KADEME_2_ORAN}."
-            )
-            degisti = True
+        # 22 parçalı plan V2:
+        # Aynı taramada 2. ve 3. kademe AÇILMAZ.
+        # Fiyatın yanında güncel teknik/momentum/hacim teyidi gerekir.
+        simdi = time.time()
+        baslangic = float(p.get("baslangic", simdi) or simdi)
 
-        if p.get("kademe2") and not p.get("kademe3") and getiri >= KADEME_3_ESIK:
-            p["kademe3"] = True
-            mesajlar.append(
-                f"🟢 3. KADEME UYGUN - {symbol}\n"
-                f"Fiyat: {fiyat:.4f} | Ilk girise gore: %{getiri:+.2f}\n"
-                f"Plan: son +%{KADEME_3_ORAN} kademe; tam plan tamamlandi."
-            )
-            degisti = True
+        if (
+            not p.get("kademe2")
+            and (simdi - baslangic) >= KADEME_2_MIN_BEKLE
+            and KADEME_2_ESIK <= getiri < KAR_AL_1_ESIK
+        ):
+            k2_ok, k2_neden = kademe_teyidi(symbol, 2, fiyat, giris, tepe)
+            if k2_ok:
+                p["kademe2"] = True
+                p["kademe2_zaman"] = simdi
+                mesajlar.append(
+                    f"🟢 2. KADEME UYGUN - {symbol}\n"
+                    f"Fiyat: {fiyat:.4f} | İlk girişe göre: %{getiri:+.2f}\n"
+                    f"Teyit: {k2_neden}\n"
+                    f"Plan: +%{KADEME_2_ORAN} kademe; toplam plan %{KADEME_1_ORAN + KADEME_2_ORAN}."
+                )
+                degisti = True
+
+        # 3. kademe ayrı bir sonraki teyit döngüsünü bekler.
+        kademe2_zaman = p.get("kademe2_zaman")
+        if (
+            p.get("kademe2")
+            and not p.get("kademe3")
+            and kademe2_zaman
+            and (simdi - float(kademe2_zaman)) >= KADEME_3_MIN_BEKLE
+            and KADEME_3_ESIK <= getiri < KAR_AL_1_ESIK
+        ):
+            k3_ok, k3_neden = kademe_teyidi(symbol, 3, fiyat, giris, tepe)
+            if k3_ok:
+                p["kademe3"] = True
+                p["kademe3_zaman"] = simdi
+                mesajlar.append(
+                    f"🟢 3. KADEME UYGUN - {symbol}\n"
+                    f"Fiyat: {fiyat:.4f} | İlk girişe göre: %{getiri:+.2f}\n"
+                    f"Teyit: {k3_neden}\n"
+                    f"Plan: son +%{KADEME_3_ORAN} kademe; tam plan tamamlandı."
+                )
+                degisti = True
 
         # İlk anlamlı kâr: 21/13 kâr koru.
         if not p.get("kar_al1") and getiri >= KAR_AL_1_ESIK:
@@ -1351,7 +1442,7 @@ def canli_kazananlari_bul(btc_3s, simdi=None):
 while True:
     try:
         print()
-        print("AI COIN ASSISTANT - V21C ORTAK V2 ORTA-SIKI | ERKEN + PARCALI + KAR KORU")
+        print("AI COIN ASSISTANT - V21C ORTAK V3 | ORTA-SIKI + TEYITLI KADEME | ERKEN + PARCALI + KAR KORU")
         print("--------------------------------")
 
         btc_d = btc_degisimleri()
@@ -1792,6 +1883,29 @@ while True:
             a["giris_kalitesi_ortak"] = giris_k
             a["devam_gucu_ortak"] = devam_g
 
+            # Açık pozisyon kademelerinde kullanılmak üzere güncel analiz özeti.
+            _t = a.get("teknik") or {}
+            _m = a.get("mikro") or {}
+            _ema20 = _t.get("ema20")
+            _ema50 = _t.get("ema50")
+            _fiyat = float(a.get("fiyat", 0) or 0)
+            SON_ANALIZ[a["symbol"]] = {
+                "zaman": time.time(),
+                "giris_kalitesi": giris_k,
+                "devam_gucu": devam_g,
+                "rsi": _t.get("rsi"),
+                "adx": _t.get("adx"),
+                "macd_ok": (_t.get("macd_hist") is not None and _t.get("macd_hist") > 0),
+                "ema_ok": (
+                    _ema20 is not None and _ema50 is not None
+                    and _ema20 > _ema50 and _fiyat > float(_ema20)
+                ),
+                "d3": _m.get("d3", 0),
+                "d5": _m.get("d5", 0),
+                "hacim1x": _m.get("hacim1x", 0),
+                "hacim_ivme": _m.get("hacim3_ivme", 0),
+            }
+
             # --------------------------------------------------
             # AL DEBUG LOG
             # Telegram'a hiçbir şey göndermez.
@@ -1997,18 +2111,30 @@ while True:
                     neden = " • ".join(nedenler[:5])
 
                     mesaj += (
-                        f"{a['symbol']} | {a.get('radar_kategori', '')}\n"
-                        f"{a.get('final_etiket', '🟢 GÜÇLÜ AL')} | AI: {a.get('ai_skoru', 0)}/100 | Risk: {a.get('risk', 'Bilinmiyor')}\n"
-                        f"📌 Plan: %{KADEME_1_ORAN} ilk kademe | +%{KADEME_2_ORAN} teyit | +%{KADEME_3_ORAN} güçlü devam\n"
-                        f"🎯 Giriş Kalitesi: {a.get('giris_kalitesi_ortak', 0)}/100 | 🚀 Devam Gücü: {a.get('devam_gucu_ortak', 0)}/100\n"
-                        f"Radar: {a['radar_skoru']}/100 | Fiyat: {round(a['fiyat'], 4)} | Hacim: {a['hacim']}x\n"
-                        f"1dk: %{(a.get('mikro') or {}).get('d1', 0)} | 3dk: %{(a.get('mikro') or {}).get('d3', 0)} | 5dk: %{(a.get('mikro') or {}).get('d5', 0)} | 10dk: %{(a.get('mikro') or {}).get('d10', 0)}\n"
-                        f"Hacim 1dk: {(a.get('mikro') or {}).get('hacim1x', 0)}x | Hacim ivme: {(a.get('mikro') or {}).get('hacim3_ivme', 0)}x\n"
-                        f"1s trend: %{a['degisim1']} | 3s trend: %{a['degisim3']}\n"
-                        f"Yarış: #{a.get('yaris_sirasi', '?')} | Güç: {a.get('yaris_skoru', 0)}/100 | İzleme: {a.get('yaris_suresi_dk', 0)} dk | Gözlem: {a.get('yaris_gozlem', 0)}\n"
+                        f"🟢 {a['symbol']} | {a.get('final_etiket', 'AL')}\n"
+                        f"Kategori: {a.get('radar_kategori', '')} | Risk: {a.get('risk', 'Bilinmiyor')}\n\n"
+
+                        f"📊 Skorlar\n"
+                        f"AI: {a.get('ai_skoru', 0)}/100 | Radar: {a.get('radar_skoru', 0)}/100\n"
+                        f"🎯 Giriş: {a.get('giris_kalitesi_ortak', 0)}/100 | 🚀 Devam: {a.get('devam_gucu_ortak', 0)}/100\n"
+                        f"🏁 Yarış: #{a.get('yaris_sirasi', '?')} | Güç: {a.get('yaris_skoru', 0)}/100\n\n"
+
+                        f"📈 Hareket\n"
+                        f"1dk: %{(a.get('mikro') or {}).get('d1', 0)} | 3dk: %{(a.get('mikro') or {}).get('d3', 0)} | "
+                        f"5dk: %{(a.get('mikro') or {}).get('d5', 0)} | 10dk: %{(a.get('mikro') or {}).get('d10', 0)}\n"
+                        f"Hacim: {a.get('hacim', 0)}x | 1dk hacim: {(a.get('mikro') or {}).get('hacim1x', 0)}x | "
+                        f"İvme: {(a.get('mikro') or {}).get('hacim3_ivme', 0)}x\n\n"
+
+                        f"🧠 Teknik\n"
                         f"EMA: {ema_yon} | RSI: {teknik['rsi']} | ADX: {teknik['adx']}\n"
-                        f"MACD: {macd_yon} | ATR: %{teknik['atr_yuzde']}\n"
-                        f"{neden_alarm}Neden: {neden}\n\n"
+                        f"MACD: {macd_yon} | ATR: %{teknik['atr_yuzde']}\n\n"
+
+                        f"💰 Plan\n"
+                        f"%{KADEME_1_ORAN} ilk giriş | +%{KADEME_2_ORAN} teyit | +%{KADEME_3_ORAN} güçlü devam\n"
+                        f"Kâr koru: +%{KAR_AL_1_ESIK:.1f} | Zarar sınırı: %{ILK_ZARAR_KES:.1f}\n\n"
+
+                        f"💵 Fiyat: {round(a['fiyat'], 4)}\n"
+                        f"{neden_alarm}📝 Neden: {neden}\n\n"
                     )
 
                 print(mesaj)
