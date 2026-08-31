@@ -68,12 +68,49 @@ def setup():
     c.commit(); c.close()
 
 def kap_bist_kodlari():
-    r=requests.get(KAP_BIST_URL,headers={'User-Agent':'Mozilla/5.0'},timeout=30); r.raise_for_status()
-    text=BeautifulSoup(r.text,'html.parser').get_text(' ',strip=True)
-    bad={'BIST','KAP','ALL','PAY','PAZAR','TÜM','ŞİRKET','ŞİRKETLERİ','BORSA','YILDIZ','ANA','ALT','PİYASA','İŞLEM'}
-    cand=set(re.findall(r'\b[A-ZÇĞİÖŞÜ0-9]{2,6}\b',text))
-    codes=sorted(x for x in cand if x not in bad and re.fullmatch(r'[A-Z0-9]+',x))
-    if len(codes)<300: raise RuntimeError(f'KAP sembol parse yetersiz: {len(codes)}')
+    """KAP BIST şirketleri tablosunun yalnızca 'Kod' sütununu okur.
+    Eski sürüm tüm sayfadaki büyük harfli kelimeleri sembol sanabildiği için
+    şehir/ünvan kelimeleri Yahoo'ya ticker olarak gönderilebiliyordu.
+    """
+    r=requests.get(
+        KAP_BIST_URL,
+        headers={'User-Agent':'Mozilla/5.0 (compatible; BISTLearningBot/1.1)'},
+        timeout=30
+    )
+    r.raise_for_status()
+    soup=BeautifulSoup(r.text,'html.parser')
+
+    codes=set()
+
+    # Önce gerçek tablo satırlarını kullan.
+    for tr in soup.find_all('tr'):
+        tds=tr.find_all('td')
+        if not tds:
+            continue
+        raw=tds[0].get_text(' ',strip=True).upper()
+        # KAP'ta bazı işlem görmeyen/özel kurum kodlarında boşluk olabiliyor.
+        # Yahoo BIST hisseleri için tek parça 3-6 karakterli kodları al.
+        if re.fullmatch(r'[A-Z0-9]{3,6}',raw):
+            codes.add(raw)
+
+    # KAP görünümü tablo etiketi kullanmazsa şirket link metinlerinden yedekle.
+    if len(codes)<250:
+        for a in soup.find_all('a'):
+            raw=a.get_text(' ',strip=True).upper()
+            href=(a.get('href') or '').lower()
+            if ('sirket' in href or 'company' in href) and re.fullmatch(r'[A-Z0-9]{3,6}',raw):
+                codes.add(raw)
+
+    # Son emniyet: yalnızca satır başında kod + şirket ünvanı kalıbını yakala.
+    if len(codes)<250:
+        page=soup.get_text('\n',strip=True)
+        for m in re.finditer(r'(?m)^([A-Z0-9]{3,6})\s*$',page):
+            codes.add(m.group(1))
+
+    codes=sorted(codes)
+    if len(codes)<250:
+        raise RuntimeError(f'KAP sembol parse yetersiz: {len(codes)}')
+    print(f'[KAP] gerçek sembol adedi={len(codes)}')
     return codes
 
 def symbol_list(c):
@@ -94,23 +131,62 @@ def symbol_list(c):
 def chunks(seq,n):
     for i in range(0,len(seq),n): yield seq[i:i+n]
 
-def download_daily(yf_symbols,period='90d'):
+def _extract_yf_frame(data,sym,batch):
+    if data is None or len(data)==0:
+        return None
+    if isinstance(data.columns,pd.MultiIndex):
+        # yfinance sürümüne göre ticker 0. veya 1. seviyede gelebilir.
+        for level in range(data.columns.nlevels):
+            vals=set(map(str,data.columns.get_level_values(level)))
+            if sym in vals:
+                try:
+                    df=data.xs(sym,axis=1,level=level).copy().dropna(how='all')
+                    if not df.empty:
+                        return df
+                except Exception:
+                    pass
+        return None
+    if len(batch)==1:
+        df=data.copy().dropna(how='all')
+        return df if not df.empty else None
+    return None
+
+def download_daily(yf_symbols,period='6mo'):
     out={}
-    for batch in chunks(yf_symbols,80):
+    failed=[]
+    for batch in chunks(yf_symbols,50):
         try:
-            data=yf.download(batch,period=period,interval='1d',auto_adjust=False,group_by='ticker',threads=True,progress=False)
-            if data is None or len(data)==0: continue
-            if isinstance(data.columns,pd.MultiIndex):
-                lvl=data.columns.get_level_values(0)
-                for sym in batch:
-                    if sym in lvl:
-                        df=data[sym].copy().dropna(how='all')
-                        if not df.empty: out[sym]=df
-            elif len(batch)==1:
-                df=data.copy().dropna(how='all')
-                if not df.empty: out[batch[0]]=df
-        except Exception as e: print('[YF BATCH HATA]',batch[:3],e)
-        time.sleep(1)
+            data=yf.download(
+                batch,period=period,interval='1d',auto_adjust=False,
+                group_by='ticker',threads=True,progress=False,timeout=30
+            )
+            for sym in batch:
+                df=_extract_yf_frame(data,sym,batch)
+                if df is not None and len(df)>=25:
+                    out[sym]=df
+                else:
+                    failed.append(sym)
+        except Exception as e:
+            print('[YF BATCH HATA]',batch[:3],e)
+            failed.extend(batch)
+        time.sleep(0.5)
+
+    # Toplu sorguda kaçanları tek tek tekrar dene.
+    retry=[s for s in dict.fromkeys(failed) if s not in out]
+    print(f'[YF] toplu_ok={len(out)} tekil_tekrar={len(retry)}')
+    for sym in retry:
+        try:
+            data=yf.download(
+                sym,period=period,interval='1d',auto_adjust=False,
+                progress=False,threads=False,timeout=20
+            )
+            df=_extract_yf_frame(data,sym,[sym])
+            if df is not None and len(df)>=25:
+                out[sym]=df
+        except Exception as e:
+            print('[YF TEKIL HATA]',sym,e)
+        time.sleep(0.12)
+    print(f'[YF] toplam_veri_ok={len(out)}/{len(yf_symbols)}')
     return out
 
 def rsi(series,n=14):
@@ -224,20 +300,60 @@ def report(c):
     return '\n'.join(lines)
 
 def run_once():
-    c=db(); codes=symbol_list(c); yfs=[f'{x}.IS' for x in codes]; print('[BIST] sembol',len(codes))
-    idx=yf.download(INDEX_SYMBOL,period='90d',interval='1d',auto_adjust=False,progress=False)
+    c=db()
+    codes=symbol_list(c)
+    yfs=[f'{x}.IS' for x in codes]
+    print('[BIST] sembol',len(codes))
+
+    idx=yf.download(
+        INDEX_SYMBOL,period='6mo',interval='1d',
+        auto_adjust=False,progress=False,threads=False,timeout=30
+    )
     if isinstance(idx.columns,pd.MultiIndex):
-        try: idx=idx.xs(INDEX_SYMBOL,axis=1,level=1)
-        except: pass
-    frames=download_daily(yfs,'90d'); saved=good=0
+        # XU100.IS hangi seviyedeyse oradan çıkar.
+        extracted=None
+        for level in range(idx.columns.nlevels):
+            if INDEX_SYMBOL in set(map(str,idx.columns.get_level_values(level))):
+                try:
+                    extracted=idx.xs(INDEX_SYMBOL,axis=1,level=level)
+                    break
+                except Exception:
+                    pass
+        if extracted is not None:
+            idx=extracted
+
+    frames=download_daily(yfs,'6mo')
+    saved=good=0
     for code in codes:
         df=frames.get(f'{code}.IS')
-        if df is None or df.empty:continue
-        try:saved+=save_rows(c,features_for_symbol(code,df,idx)); good+=1
-        except Exception as e:print('[FEATURE HATA]',code,e)
-    meta_set(c,'last_run_day',datetime.now(LOCAL_TZ).date().isoformat()); c.commit()
-    print(f'[BIST ÖĞRENİYOR] kod={len(codes)} veri_ok={good} rows={saved}')
-    tg(report(c)); c.close()
+        if df is None or df.empty:
+            continue
+        try:
+            rows=features_for_symbol(code,df,idx)
+            if rows:
+                saved+=save_rows(c,rows)
+                good+=1
+        except Exception as e:
+            print('[FEATURE HATA]',code,e)
+
+    c.commit()
+    total=c.execute('select count(*) from daily_features').fetchone()[0] or 0
+    print(f'[BIST ÖĞRENİYOR] kod={len(codes)} veri_ok={good} rows_yazildi={saved} db_toplam={total}')
+
+    # Veri gerçekten oluşmadan "0/0" öğrenme raporu gönderme.
+    if total==0:
+        tg(
+            '⚠️ BIST ÖĞRENME VERİSİ OLUŞMADI\n'
+            f'KAP kodu: {len(codes)} | Yahoo veri OK: {good} | Satır: {saved}\n'
+            '0/0 raporu gönderilmedi. Railway logunda [YF] ve [FEATURE HATA] satırlarını kontrol et.'
+        )
+        c.close()
+        return
+
+    meta_set(c,'last_run_day',datetime.now(LOCAL_TZ).date().isoformat())
+    c.commit()
+    tg(report(c))
+    c.close()
 
 def should_run(c):
     now=datetime.now(LOCAL_TZ)
@@ -246,7 +362,7 @@ def should_run(c):
     return now.hour>RUN_AFTER_HOUR or (now.hour==RUN_AFTER_HOUR and now.minute>=RUN_AFTER_MINUTE)
 
 def main():
-    setup(); print('BIST TAVAN ÖĞRENEN BOT V1',DB_PATH)
+    setup(); print('BIST TAVAN ÖĞRENEN BOT V1.1 BACKFILL FIX',DB_PATH)
     tg('🧠 BIST TAVAN ÖĞRENEN BOT BAŞLADI\nSadece BIST100 değil, KAP içindeki BIST şirketlerinin tamamını izleyecek.\nHedef: Her gün tavan görenleri bulup, tavan olmadan önce diğer hisselerden hangi özelliklerle ayrıldıklarını öğrenmek.\nİlk aşamada AL/SAT mesajı yok.')
     while True:
         c=db()
