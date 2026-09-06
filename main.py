@@ -17,10 +17,14 @@ LOOP_SECONDS=900
 RUN_AFTER_HOUR=18
 RUN_AFTER_MINUTE=20
 MIN_COMBO_N=12
+YF_BATCH_SIZE=int(os.getenv('YF_BATCH_SIZE','20'))
+YF_BATCH_PAUSE=float(os.getenv('YF_BATCH_PAUSE','2.0'))
+YF_MAX_RETRIES=int(os.getenv('YF_MAX_RETRIES','3'))
+YF_BACKOFF_BASE=float(os.getenv('YF_BACKOFF_BASE','5.0'))
 
 def fix_text(s):
     if not isinstance(s,str): s=str(s)
-    if any(x in s for x in ('Ã','Ä','Å','ð','Â','â')):
+    if any(x in s for x in ('Ã','Ã','Ã','Ã°','Ã','Ã¢')):
         try:s=s.encode('latin1').decode('utf-8')
         except:pass
     return s
@@ -68,9 +72,9 @@ def setup():
     c.commit(); c.close()
 
 def kap_bist_kodlari():
-    """KAP BIST şirketleri tablosunun yalnızca 'Kod' sütununu okur.
-    Eski sürüm tüm sayfadaki büyük harfli kelimeleri sembol sanabildiği için
-    şehir/ünvan kelimeleri Yahoo'ya ticker olarak gönderilebiliyordu.
+    """KAP BIST Åirketleri tablosunun yalnÄ±zca 'Kod' sÃ¼tununu okur.
+    Eski sÃ¼rÃ¼m tÃ¼m sayfadaki bÃ¼yÃ¼k harfli kelimeleri sembol sanabildiÄi iÃ§in
+    Åehir/Ã¼nvan kelimeleri Yahoo'ya ticker olarak gÃ¶nderilebiliyordu.
     """
     r=requests.get(
         KAP_BIST_URL,
@@ -82,18 +86,18 @@ def kap_bist_kodlari():
 
     codes=set()
 
-    # Önce gerçek tablo satırlarını kullan.
+    # Ãnce gerÃ§ek tablo satÄ±rlarÄ±nÄ± kullan.
     for tr in soup.find_all('tr'):
         tds=tr.find_all('td')
         if not tds:
             continue
         raw=tds[0].get_text(' ',strip=True).upper()
-        # KAP'ta bazı işlem görmeyen/özel kurum kodlarında boşluk olabiliyor.
-        # Yahoo BIST hisseleri için tek parça 3-6 karakterli kodları al.
+        # KAP'ta bazÄ± iÅlem gÃ¶rmeyen/Ã¶zel kurum kodlarÄ±nda boÅluk olabiliyor.
+        # Yahoo BIST hisseleri iÃ§in tek parÃ§a 3-6 karakterli kodlarÄ± al.
         if re.fullmatch(r'[A-Z0-9]{3,6}',raw):
             codes.add(raw)
 
-    # KAP görünümü tablo etiketi kullanmazsa şirket link metinlerinden yedekle.
+    # KAP gÃ¶rÃ¼nÃ¼mÃ¼ tablo etiketi kullanmazsa Åirket link metinlerinden yedekle.
     if len(codes)<250:
         for a in soup.find_all('a'):
             raw=a.get_text(' ',strip=True).upper()
@@ -101,7 +105,7 @@ def kap_bist_kodlari():
             if ('sirket' in href or 'company' in href) and re.fullmatch(r'[A-Z0-9]{3,6}',raw):
                 codes.add(raw)
 
-    # Son emniyet: yalnızca satır başında kod + şirket ünvanı kalıbını yakala.
+    # Son emniyet: yalnÄ±zca satÄ±r baÅÄ±nda kod + Åirket Ã¼nvanÄ± kalÄ±bÄ±nÄ± yakala.
     if len(codes)<250:
         page=soup.get_text('\n',strip=True)
         for m in re.finditer(r'(?m)^([A-Z0-9]{3,6})\s*$',page):
@@ -110,7 +114,7 @@ def kap_bist_kodlari():
     codes=sorted(codes)
     if len(codes)<250:
         raise RuntimeError(f'KAP sembol parse yetersiz: {len(codes)}')
-    print(f'[KAP] gerçek sembol adedi={len(codes)}')
+    print(f'[KAP] gerÃ§ek sembol adedi={len(codes)}')
     return codes
 
 def symbol_list(c):
@@ -135,7 +139,7 @@ def _extract_yf_frame(data,sym,batch):
     if data is None or len(data)==0:
         return None
     if isinstance(data.columns,pd.MultiIndex):
-        # yfinance sürümüne göre ticker 0. veya 1. seviyede gelebilir.
+        # yfinance sÃ¼rÃ¼mÃ¼ne gÃ¶re ticker 0. veya 1. seviyede gelebilir.
         for level in range(data.columns.nlevels):
             vals=set(map(str,data.columns.get_level_values(level)))
             if sym in vals:
@@ -151,41 +155,68 @@ def _extract_yf_frame(data,sym,batch):
         return df if not df.empty else None
     return None
 
+def _is_rate_limit_error(exc):
+    t=str(exc).lower()
+    return ('ratelimit' in t or 'rate limit' in t or 'too many requests' in t or '429' in t)
+
+def _yf_download_with_retry(symbols,period='6mo',group_by='ticker'):
+    last_exc=None
+    for attempt in range(1,YF_MAX_RETRIES+1):
+        try:
+            data=yf.download(
+                symbols,period=period,interval='1d',auto_adjust=False,
+                group_by=group_by,threads=False,progress=False,timeout=45
+            )
+            if data is not None and len(data)>0:
+                return data
+            last_exc=RuntimeError('Yahoo boÅ veri dÃ¶ndÃ¼rdÃ¼')
+        except Exception as e:
+            last_exc=e
+            if _is_rate_limit_error(e):
+                wait=YF_BACKOFF_BASE*(2**(attempt-1))
+                print(f'[YF RATE LIMIT] deneme={attempt}/{YF_MAX_RETRIES} bekleme={wait:.1f}s')
+                time.sleep(wait)
+            else:
+                print(f'[YF RETRY] deneme={attempt}/{YF_MAX_RETRIES} hata={e}')
+                time.sleep(min(3.0*attempt,10.0))
+    if last_exc:
+        print('[YF GRUP BASARISIZ]',str(last_exc)[:180])
+    return None
+
 def download_daily(yf_symbols,period='6mo'):
     out={}
     failed=[]
-    for batch in chunks(yf_symbols,50):
-        try:
-            data=yf.download(
-                batch,period=period,interval='1d',auto_adjust=False,
-                group_by='ticker',threads=True,progress=False,timeout=30
-            )
+    batches=list(chunks(yf_symbols,YF_BATCH_SIZE))
+    for bi,batch in enumerate(batches,1):
+        data=_yf_download_with_retry(batch,period=period,group_by='ticker')
+        if data is None or len(data)==0:
+            failed.extend(batch)
+        else:
             for sym in batch:
                 df=_extract_yf_frame(data,sym,batch)
                 if df is not None and len(df)>=25:
                     out[sym]=df
                 else:
                     failed.append(sym)
-        except Exception as e:
-            print('[YF BATCH HATA]',batch[:3],e)
-            failed.extend(batch)
-        time.sleep(0.5)
+        print(f'[YF] batch={bi}/{len(batches)} ok={len(out)} fail={len(set(failed))}')
+        time.sleep(YF_BATCH_PAUSE)
 
-    # Toplu sorguda kaçanları tek tek tekrar dene.
+    # ÃNEMLÄ°: Eksikleri 711 ayrÄ± istekle tek tek yeniden denemiyoruz.
+    # Bu davranÄ±Å Yahoo rate-limitini tetikliyordu. Eksikler ikinci bir kÃ¼Ã§Ã¼k toplu turda denenir.
     retry=[s for s in dict.fromkeys(failed) if s not in out]
-    print(f'[YF] toplu_ok={len(out)} tekil_tekrar={len(retry)}')
-    for sym in retry:
-        try:
-            data=yf.download(
-                sym,period=period,interval='1d',auto_adjust=False,
-                progress=False,threads=False,timeout=20
-            )
-            df=_extract_yf_frame(data,sym,[sym])
-            if df is not None and len(df)>=25:
-                out[sym]=df
-        except Exception as e:
-            print('[YF TEKIL HATA]',sym,e)
-        time.sleep(0.12)
+    if retry:
+        print(f'[YF] ikinci_toplu_tur={len(retry)}')
+        time.sleep(max(10.0,YF_BACKOFF_BASE))
+        for bi,batch in enumerate(chunks(retry,max(5,YF_BATCH_SIZE//2)),1):
+            data=_yf_download_with_retry(batch,period=period,group_by='ticker')
+            if data is not None and len(data)>0:
+                for sym in batch:
+                    if sym in out:
+                        continue
+                    df=_extract_yf_frame(data,sym,batch)
+                    if df is not None and len(df)>=25:
+                        out[sym]=df
+            time.sleep(YF_BATCH_PAUSE*1.5)
     print(f'[YF] toplam_veri_ok={len(out)}/{len(yf_symbols)}')
     return out
 
@@ -252,7 +283,7 @@ def feature_lifts(c,lookback_days=60):
         vals=c.execute(f'select {col},next_tavan_hit from daily_features where day>=? and {col} is not null',(since,)).fetchall()
         if len(vals)<100:continue
         arr=np.array([float(v) for v,_ in vals]); q1,q2,q3=np.quantile(arr,[.25,.5,.75])
-        for name,lo,hi in [('düşük',None,q1),('orta-alt',q1,q2),('orta-üst',q2,q3),('yüksek',q3,None)]:
+        for name,lo,hi in [('dÃ¼ÅÃ¼k',None,q1),('orta-alt',q1,q2),('orta-Ã¼st',q2,q3),('yÃ¼ksek',q3,None)]:
             ss=[int(h or 0) for v,h in vals if (lo is None or float(v)>=lo) and (hi is None or float(v)<hi)]
             if len(ss)<30:continue
             rate=sum(ss)/len(ss); findings.append({'feature':col,'lo':lo,'hi':hi,'n':len(ss),'rate':rate,'lift':rate/base if base else 0})
@@ -287,16 +318,16 @@ def combo_lifts(c,lookback_days=60):
 
 def report(c):
     total,hits,findings=feature_lifts(c,60); combos=combo_lifts(c,60); base=hits/total if total else 0
-    lines=['📈 BIST TAVAN ÖĞRENME RAPORU','',f'Son 60 günde tavan-görme taban oranı: %{base*100:.2f} ({hits}/{total})']
+    lines=['ð BIST TAVAN ÃÄRENME RAPORU','',f'Son 60 gÃ¼nde tavan-gÃ¶rme taban oranÄ±: %{base*100:.2f} ({hits}/{total})']
     if findings:
-        lines+=['','🧠 Tavan öncesinde öne çıkan tekil özellikler:']
+        lines+=['','ð§  Tavan Ã¶ncesinde Ã¶ne Ã§Ä±kan tekil Ã¶zellikler:']
         for f in findings[:5]:
             rng=f"<{f['hi']:.2f}" if f['lo'] is None else (f">={f['lo']:.2f}" if f['hi'] is None else f"{f['lo']:.2f}-{f['hi']:.2f}")
-            lines.append(f"• {f['feature']} {rng} → tavan %{f['rate']*100:.2f}, bazın {f['lift']:.2f}x (n={f['n']})")
+            lines.append(f"â¢ {f['feature']} {rng} â tavan %{f['rate']*100:.2f}, bazÄ±n {f['lift']:.2f}x (n={f['n']})")
     if combos:
-        lines+=['','🧩 En güçlü tavan-öncesi kombinasyonlar:']
-        for x in combos[:5]: lines.append(f"• {x['name']} → tavan %{x['rate']*100:.2f}, bazın {x['lift']:.2f}x (n={x['n']})")
-    lines+=['','Not: İlk aşamada AL sinyali yok; amaç tavan yapanların yapmayanlardan gerçek farkını öğrenmek.']
+        lines+=['','ð§© En gÃ¼Ã§lÃ¼ tavan-Ã¶ncesi kombinasyonlar:']
+        for x in combos[:5]: lines.append(f"â¢ {x['name']} â tavan %{x['rate']*100:.2f}, bazÄ±n {x['lift']:.2f}x (n={x['n']})")
+    lines+=['','Not: Ä°lk aÅamada AL sinyali yok; amaÃ§ tavan yapanlarÄ±n yapmayanlardan gerÃ§ek farkÄ±nÄ± Ã¶Ärenmek.']
     return '\n'.join(lines)
 
 def run_once():
@@ -305,12 +336,11 @@ def run_once():
     yfs=[f'{x}.IS' for x in codes]
     print('[BIST] sembol',len(codes))
 
-    idx=yf.download(
-        INDEX_SYMBOL,period='6mo',interval='1d',
-        auto_adjust=False,progress=False,threads=False,timeout=30
-    )
+    idx=_yf_download_with_retry(INDEX_SYMBOL,period='6mo',group_by='column')
+    if idx is None:
+        idx=pd.DataFrame()
     if isinstance(idx.columns,pd.MultiIndex):
-        # XU100.IS hangi seviyedeyse oradan çıkar.
+        # XU100.IS hangi seviyedeyse oradan Ã§Ä±kar.
         extracted=None
         for level in range(idx.columns.nlevels):
             if INDEX_SYMBOL in set(map(str,idx.columns.get_level_values(level))):
@@ -338,14 +368,14 @@ def run_once():
 
     c.commit()
     total=c.execute('select count(*) from daily_features').fetchone()[0] or 0
-    print(f'[BIST ÖĞRENİYOR] kod={len(codes)} veri_ok={good} rows_yazildi={saved} db_toplam={total}')
+    print(f'[BIST ÃÄRENÄ°YOR] kod={len(codes)} veri_ok={good} rows_yazildi={saved} db_toplam={total}')
 
-    # Veri gerçekten oluşmadan "0/0" öğrenme raporu gönderme.
+    # Veri gerÃ§ekten oluÅmadan "0/0" Ã¶Ärenme raporu gÃ¶nderme.
     if total==0:
         tg(
-            '⚠️ BIST ÖĞRENME VERİSİ OLUŞMADI\n'
-            f'KAP kodu: {len(codes)} | Yahoo veri OK: {good} | Satır: {saved}\n'
-            '0/0 raporu gönderilmedi. Railway logunda [YF] ve [FEATURE HATA] satırlarını kontrol et.'
+            'â ï¸ BIST ÃÄRENME VERÄ°SÄ° OLUÅMADI\n'
+            f'KAP kodu: {len(codes)} | Yahoo veri OK: {good} | SatÄ±r: {saved}\n'
+            '0/0 raporu gÃ¶nderilmedi. Railway logunda [YF] ve [FEATURE HATA] satÄ±rlarÄ±nÄ± kontrol et.'
         )
         c.close()
         return
@@ -362,8 +392,8 @@ def should_run(c):
     return now.hour>RUN_AFTER_HOUR or (now.hour==RUN_AFTER_HOUR and now.minute>=RUN_AFTER_MINUTE)
 
 def main():
-    setup(); print('BIST TAVAN ÖĞRENEN BOT V1.1 BACKFILL FIX',DB_PATH)
-    tg('🧠 BIST TAVAN ÖĞRENEN BOT BAŞLADI\nSadece BIST100 değil, KAP içindeki BIST şirketlerinin tamamını izleyecek.\nHedef: Her gün tavan görenleri bulup, tavan olmadan önce diğer hisselerden hangi özelliklerle ayrıldıklarını öğrenmek.\nİlk aşamada AL/SAT mesajı yok.')
+    setup(); print('BIST TAVAN ÃÄRENEN BOT V1.2 YF RATE LIMIT FIX',DB_PATH)
+    tg('ð§  BIST TAVAN ÃÄRENEN BOT BAÅLADI\nSadece BIST100 deÄil, KAP iÃ§indeki BIST Åirketlerinin tamamÄ±nÄ± izleyecek.\nHedef: Her gÃ¼n tavan gÃ¶renleri bulup, tavan olmadan Ã¶nce diÄer hisselerden hangi Ã¶zelliklerle ayrÄ±ldÄ±klarÄ±nÄ± Ã¶Ärenmek.\nÄ°lk aÅamada AL/SAT mesajÄ± yok.')
     while True:
         c=db()
         try:run=should_run(c)
