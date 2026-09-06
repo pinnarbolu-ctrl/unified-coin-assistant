@@ -232,6 +232,32 @@ def atr_pct(df,n=14):
 
 FEATURE_COLS=['ret1','ret3','ret5','ret10','vol_ratio5','vol_ratio20','range5','range20','compression5','rsi14','atr14_pct','dist_high20','dist_high50','green3','green5','index_ret1','index_ret5','rel1','rel5','prev_tavan20']
 
+FEATURE_LABELS={
+    "ret1":"1 gÃ¼nlÃ¼k momentum",
+    "ret3":"3 gÃ¼nlÃ¼k momentum",
+    "ret5":"5 gÃ¼nlÃ¼k momentum",
+    "ret10":"10 gÃ¼nlÃ¼k momentum",
+    "vol_ratio5":"Hacim / 5 gÃ¼nlÃ¼k ortalama",
+    "vol_ratio20":"Hacim / 20 gÃ¼nlÃ¼k ortalama",
+    "range5":"5 gÃ¼nlÃ¼k fiyat aralÄ±ÄÄ±",
+    "range20":"20 gÃ¼nlÃ¼k fiyat aralÄ±ÄÄ±",
+    "compression5":"5 gÃ¼nlÃ¼k sÄ±kÄ±Åma oranÄ±",
+    "rsi14":"RSI (14)",
+    "atr14_pct":"ATR (14) yÃ¼zdesi",
+    "dist_high20":"20 gÃ¼nlÃ¼k zirveye uzaklÄ±k",
+    "dist_high50":"50 gÃ¼nlÃ¼k zirveye uzaklÄ±k",
+    "green3":"Son 3 gÃ¼nde yeÅil gÃ¼n sayÄ±sÄ±",
+    "green5":"Son 5 gÃ¼nde yeÅil gÃ¼n sayÄ±sÄ±",
+    "index_ret1":"BIST 100 1 gÃ¼nlÃ¼k deÄiÅim",
+    "index_ret5":"BIST 100 5 gÃ¼nlÃ¼k deÄiÅim",
+    "rel1":"Hissenin BIST 100'e gÃ¶re 1 gÃ¼nlÃ¼k gÃ¼cÃ¼",
+    "rel5":"Hissenin BIST 100'e gÃ¶re 5 gÃ¼nlÃ¼k gÃ¼cÃ¼",
+    "prev_tavan20":"Son 20 gÃ¼nde tavan sayÄ±sÄ±",
+}
+
+def feature_label(col):
+    return FEATURE_LABELS.get(col,col)
+
 def features_for_symbol(code,df,index_df):
     if df is None or len(df)<25:return []
     df=df.copy(); df.columns=[str(x) for x in df.columns]
@@ -292,9 +318,10 @@ def feature_lifts(c,lookback_days=60):
 
 def where_from(f):
     col,lo,hi=f['feature'],f['lo'],f['hi']
-    if lo is None:return f'{col}<{hi}',f'{col}<{hi:.2f}'
-    if hi is None:return f'{col}>={lo}',f'{col}>={lo:.2f}'
-    return f'{col}>={lo} and {col}<{hi}',f'{col} {lo:.2f}-{hi:.2f}'
+    etiket=feature_label(col)
+    if lo is None:return f'{col}<{hi}',f'{etiket} < {hi:.2f}'
+    if hi is None:return f'{col}>={lo}',f'{etiket} â¥ {lo:.2f}'
+    return f'{col}>={lo} and {col}<{hi}',f'{etiket} {lo:.2f}-{hi:.2f}'
 
 def combo_lifts(c,lookback_days=60):
     total,hits,top=feature_lifts(c,lookback_days)
@@ -318,12 +345,12 @@ def combo_lifts(c,lookback_days=60):
 
 def report(c):
     total,hits,findings=feature_lifts(c,60); combos=combo_lifts(c,60); base=hits/total if total else 0
-    lines=['ð BIST TAVAN ÃÄRENME RAPORU','',f'Son 60 gÃ¼nde tavan-gÃ¶rme taban oranÄ±: %{base*100:.2f} ({hits}/{total})']
+    lines=['ð BIST TAVAN ÃÄRENME RAPORU','',f'Son 60 gÃ¼nde tavan gÃ¶rme oranÄ±: %{base*100:.2f} ({hits}/{total})']
     if findings:
         lines+=['','ð§  Tavan Ã¶ncesinde Ã¶ne Ã§Ä±kan tekil Ã¶zellikler:']
         for f in findings[:5]:
             rng=f"<{f['hi']:.2f}" if f['lo'] is None else (f">={f['lo']:.2f}" if f['hi'] is None else f"{f['lo']:.2f}-{f['hi']:.2f}")
-            lines.append(f"â¢ {f['feature']} {rng} â tavan %{f['rate']*100:.2f}, bazÄ±n {f['lift']:.2f}x (n={f['n']})")
+            lines.append(f"â¢ {feature_label(f['feature'])} {rng} â tavan %{f['rate']*100:.2f}, bazÄ±n {f['lift']:.2f}x (n={f['n']})")
     if combos:
         lines+=['','ð§© En gÃ¼Ã§lÃ¼ tavan-Ã¶ncesi kombinasyonlar:']
         for x in combos[:5]: lines.append(f"â¢ {x['name']} â tavan %{x['rate']*100:.2f}, bazÄ±n {x['lift']:.2f}x (n={x['n']})")
