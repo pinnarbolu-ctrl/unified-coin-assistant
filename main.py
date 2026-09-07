@@ -38,6 +38,7 @@ YF_CIRCUIT_FILE=os.path.join(DATA_DIR,'yf_rate_limit_until.txt')
 YF_CACHE_MAX_AGE_HOURS=float(os.getenv('YF_CACHE_MAX_AGE_HOURS','20'))
 YF_CACHE_DIR=os.path.join(DATA_DIR,'yf_cache')
 os.makedirs(YF_CACHE_DIR,exist_ok=True)
+YF_INVALID_FILE=os.path.join(DATA_DIR,'yf_invalid_symbols.json')
 
 def fix_text(s):
     if not isinstance(s, str):
@@ -198,6 +199,42 @@ def _extract_yf_frame(data,sym,batch):
     return None
 
 
+
+def _invalid_load():
+    try:
+        if not os.path.exists(YF_INVALID_FILE):
+            return {}
+        with open(YF_INVALID_FILE,'r',encoding='utf-8') as f:
+            obj=json.load(f)
+        return obj if isinstance(obj,dict) else {}
+    except Exception as e:
+        print('[YF INVALID READ ERROR]',str(e)[:120])
+        return {}
+
+def _invalid_save(obj):
+    tmp=YF_INVALID_FILE+'.tmp'
+    try:
+        with open(tmp,'w',encoding='utf-8') as f:
+            json.dump(obj,f,ensure_ascii=False,indent=2,sort_keys=True)
+        os.replace(tmp,YF_INVALID_FILE)
+        return True
+    except Exception as e:
+        print('[YF INVALID WRITE ERROR]',str(e)[:120])
+        try:
+            if os.path.exists(tmp): os.remove(tmp)
+        except Exception: pass
+        return False
+
+def _invalid_mark(sym,reason='no_data'):
+    obj=_invalid_load()
+    if sym not in obj:
+        obj[sym]={'reason':reason,'first_seen':datetime.now(LOCAL_TZ).isoformat(timespec='seconds')}
+        _invalid_save(obj)
+        print(f'[YF INVALID] {sym} marked; reason={reason}')
+
+def _invalid_set():
+    return set(_invalid_load().keys())
+
 def _cache_path(sym):
     safe=re.sub(r'[^A-Za-z0-9_.-]+','_',sym)
     return os.path.join(YF_CACHE_DIR,safe+'.pkl')
@@ -303,12 +340,18 @@ def _yf_download_with_retry(symbols,period='6mo',group_by='ticker'):
 
 def download_daily(yf_symbols,period='6mo'):
     # 1) Cache'i once yukle. Taze cache icin Yahoo'ya hic istek atma.
-    # 2) Yalniz eksik veya bayat sembolleri yavas gruplar halinde yenile.
-    # 3) Yahoo rate-limit verirse bayat cache'i kullanmaya devam et.
+    # 2) Daha once kesin 'veri yok' olarak isaretlenen sembolleri Yahoo'ya tekrar sorma.
+    # 3) Yalniz eksik veya bayat sembolleri yavas gruplar halinde yenile.
+    # 4) Yahoo rate-limit verirse bayat cache'i kullanmaya devam et.
     out={}
     stale_cache={}
     need_refresh=[]
+    invalid=_invalid_set()
+    if invalid:
+        print(f'[YF INVALID] skipped={len(invalid)}')
     for sym in yf_symbols:
+        if sym in invalid:
+            continue
         df,age_h=_cache_load(sym,allow_stale=True)
         if df is not None:
             out[sym]=df
@@ -316,8 +359,9 @@ def download_daily(yf_symbols,period='6mo'):
         if df is None or not _cache_is_fresh(age_h):
             need_refresh.append(sym)
 
-    fresh_count=len(yf_symbols)-len(need_refresh)
-    print(f'[YF CACHE] total={len(yf_symbols)} fresh={fresh_count} refresh={len(need_refresh)} cached_any={len(out)}')
+    eligible_total=sum(1 for x in yf_symbols if x not in invalid)
+    fresh_count=eligible_total-len(need_refresh)
+    print(f'[YF CACHE] total={len(yf_symbols)} invalid={len(invalid)} fresh={fresh_count} refresh={len(need_refresh)} cached_any={len(out)}')
     if not need_refresh:
         print(f'[YF] cache_only ok={len(out)}/{len(yf_symbols)}')
         return out
@@ -342,12 +386,17 @@ def download_daily(yf_symbols,period='6mo'):
                     _cache_save(sym,df)
                 else:
                     failed.append(sym)
+                    # Grup cevabi geldi ama bu sembol icin 25+ mumluk veri yoksa
+                    # bunu kalici 'veri yok/delist' listesine al. Rate-limit/grup
+                    # hatalarinda bu blok calismaz, dolayisiyla gecici hata blacklist olmaz.
+                    _invalid_mark(sym,'no_data_or_delisted')
+                    invalid.add(sym)
         print(f'[YF] batch={bi}/{len(batches)} cache+new_ok={len(out)} refresh_fail={len(set(failed))}')
         if bi < len(batches):
             time.sleep(YF_BATCH_PAUSE)
 
     # Yalniz hic cache'i olmayan eksikleri bir kez daha, 5'li gruplarda dene.
-    retry=[s for s in dict.fromkeys(failed) if s not in stale_cache and s not in out]
+    retry=[s for s in dict.fromkeys(failed) if s not in stale_cache and s not in out and s not in invalid]
     if retry and _circuit_until_get()<=time.time():
         print(f'[YF] missing_retry={len(retry)}')
         time.sleep(max(YF_BACKOFF_BASE,60.0))
@@ -362,7 +411,7 @@ def download_daily(yf_symbols,period='6mo'):
             time.sleep(max(YF_BATCH_PAUSE,8.0))
 
     # Refresh basarisiz olsa bile eski cache silinmez; out zaten onu tasiyor.
-    print(f'[YF] total_data_ok={len(out)}/{len(yf_symbols)} newly_missing={sum(1 for s in yf_symbols if s not in out)}')
+    print(f'[YF] total_data_ok={len(out)}/{eligible_total} invalid_skipped={len(invalid)} newly_missing={sum(1 for s in yf_symbols if s not in out and s not in invalid)}')
     return out
 
 def download_index(period='6mo'):
@@ -715,7 +764,7 @@ def should_run(c):
     return now.hour>RUN_AFTER_HOUR or (now.hour==RUN_AFTER_HOUR and now.minute>=RUN_AFTER_MINUTE)
 
 def main():
-    setup(); print('BIST TAVAN OGRENEN BOT V1.4 CACHE + CIRCUIT + VOLUME',DB_PATH)
+    setup(); print('BIST TAVAN OGRENEN BOT V1.5 CACHE + CIRCUIT + INVALID',DB_PATH)
     tg('ð§  BIST TAVAN ÃÄRENEN BOT BAÅLADI\nSadece BIST100 deÄil, KAP iÃ§indeki BIST Åirketlerinin tamamÄ±nÄ± izleyecek.\nHedef: Her gÃ¼n tavan gÃ¶renleri bulup, tavan olmadan Ã¶nce diÄer hisselerden hangi Ã¶zelliklerle ayrÄ±ldÄ±klarÄ±nÄ± Ã¶Ärenmek.\nÄ°lk aÅamada AL/SAT mesajÄ± yok.')
     while True:
         c=db()
