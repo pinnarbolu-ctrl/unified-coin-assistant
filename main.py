@@ -18,10 +18,13 @@ LOOP_SECONDS=900
 RUN_AFTER_HOUR=18
 RUN_AFTER_MINUTE=20
 MIN_COMBO_N=12
-YF_BATCH_SIZE=int(os.getenv('YF_BATCH_SIZE','20'))
-YF_BATCH_PAUSE=float(os.getenv('YF_BATCH_PAUSE','2.0'))
+YF_BATCH_SIZE=int(os.getenv('YF_BATCH_SIZE','10'))
+YF_BATCH_PAUSE=float(os.getenv('YF_BATCH_PAUSE','8.0'))
 YF_MAX_RETRIES=int(os.getenv('YF_MAX_RETRIES','3'))
-YF_BACKOFF_BASE=float(os.getenv('YF_BACKOFF_BASE','5.0'))
+YF_BACKOFF_BASE=float(os.getenv('YF_BACKOFF_BASE','60.0'))
+YF_CACHE_MAX_AGE_HOURS=float(os.getenv('YF_CACHE_MAX_AGE_HOURS','20'))
+YF_CACHE_DIR=os.path.join(DATA_DIR,'yf_cache')
+os.makedirs(YF_CACHE_DIR,exist_ok=True)
 
 def fix_text(s):
     if not isinstance(s, str):
@@ -181,6 +184,46 @@ def _extract_yf_frame(data,sym,batch):
         return df if not df.empty else None
     return None
 
+
+def _cache_path(sym):
+    safe=re.sub(r'[^A-Za-z0-9_.-]+','_',sym)
+    return os.path.join(YF_CACHE_DIR,safe+'.pkl')
+
+def _cache_load(sym, allow_stale=True):
+    path=_cache_path(sym)
+    if not os.path.exists(path):
+        return None, None
+    try:
+        age_h=max(0.0,(time.time()-os.path.getmtime(path))/3600.0)
+        if (not allow_stale) and age_h>YF_CACHE_MAX_AGE_HOURS:
+            return None, age_h
+        df=pd.read_pickle(path)
+        if df is None or len(df)<25:
+            return None, age_h
+        return df, age_h
+    except Exception as e:
+        print('[YF CACHE READ ERROR]',sym,str(e)[:120])
+        return None, None
+
+def _cache_save(sym,df):
+    if df is None or len(df)<25:
+        return False
+    path=_cache_path(sym)
+    tmp=path+'.tmp'
+    try:
+        df.to_pickle(tmp)
+        os.replace(tmp,path)
+        return True
+    except Exception as e:
+        print('[YF CACHE WRITE ERROR]',sym,str(e)[:120])
+        try:
+            if os.path.exists(tmp): os.remove(tmp)
+        except Exception: pass
+        return False
+
+def _cache_is_fresh(age_h):
+    return age_h is not None and age_h<=YF_CACHE_MAX_AGE_HOURS
+
 def _is_rate_limit_error(exc):
     t=str(exc).lower()
     return ('ratelimit' in t or 'rate limit' in t or 'too many requests' in t or '429' in t)
@@ -195,24 +238,44 @@ def _yf_download_with_retry(symbols,period='6mo',group_by='ticker'):
             )
             if data is not None and len(data)>0:
                 return data
-            last_exc=RuntimeError('Yahoo boÅ veri dÃ¶ndÃ¼rdÃ¼')
+            last_exc=RuntimeError('Yahoo returned empty data')
         except Exception as e:
             last_exc=e
-            if _is_rate_limit_error(e):
+        if attempt < YF_MAX_RETRIES:
+            if last_exc is not None and _is_rate_limit_error(last_exc):
                 wait=YF_BACKOFF_BASE*(2**(attempt-1))
-                print(f'[YF RATE LIMIT] deneme={attempt}/{YF_MAX_RETRIES} bekleme={wait:.1f}s')
-                time.sleep(wait)
+                print(f'[YF RATE LIMIT] attempt={attempt}/{YF_MAX_RETRIES} sleep={wait:.0f}s')
             else:
-                print(f'[YF RETRY] deneme={attempt}/{YF_MAX_RETRIES} hata={e}')
-                time.sleep(min(3.0*attempt,10.0))
+                wait=min(15.0*attempt,45.0)
+                print(f'[YF RETRY] attempt={attempt}/{YF_MAX_RETRIES} sleep={wait:.0f}s err={str(last_exc)[:100]}')
+            time.sleep(wait)
     if last_exc:
-        print('[YF GRUP BASARISIZ]',str(last_exc)[:180])
+        print('[YF GROUP FAILED]',str(last_exc)[:180])
     return None
 
 def download_daily(yf_symbols,period='6mo'):
+    # 1) Cache'i once yukle. Taze cache icin Yahoo'ya hic istek atma.
+    # 2) Yalniz eksik veya bayat sembolleri yavas gruplar halinde yenile.
+    # 3) Yahoo rate-limit verirse bayat cache'i kullanmaya devam et.
     out={}
+    stale_cache={}
+    need_refresh=[]
+    for sym in yf_symbols:
+        df,age_h=_cache_load(sym,allow_stale=True)
+        if df is not None:
+            out[sym]=df
+            stale_cache[sym]=df
+        if df is None or not _cache_is_fresh(age_h):
+            need_refresh.append(sym)
+
+    fresh_count=len(yf_symbols)-len(need_refresh)
+    print(f'[YF CACHE] total={len(yf_symbols)} fresh={fresh_count} refresh={len(need_refresh)} cached_any={len(out)}')
+    if not need_refresh:
+        print(f'[YF] cache_only ok={len(out)}/{len(yf_symbols)}')
+        return out
+
+    batches=list(chunks(need_refresh,YF_BATCH_SIZE))
     failed=[]
-    batches=list(chunks(yf_symbols,YF_BATCH_SIZE))
     for bi,batch in enumerate(batches,1):
         data=_yf_download_with_retry(batch,period=period,group_by='ticker')
         if data is None or len(data)==0:
@@ -222,29 +285,58 @@ def download_daily(yf_symbols,period='6mo'):
                 df=_extract_yf_frame(data,sym,batch)
                 if df is not None and len(df)>=25:
                     out[sym]=df
+                    _cache_save(sym,df)
                 else:
                     failed.append(sym)
-        print(f'[YF] batch={bi}/{len(batches)} ok={len(out)} fail={len(set(failed))}')
-        time.sleep(YF_BATCH_PAUSE)
+        print(f'[YF] batch={bi}/{len(batches)} cache+new_ok={len(out)} refresh_fail={len(set(failed))}')
+        if bi < len(batches):
+            time.sleep(YF_BATCH_PAUSE)
 
-    # ÃNEMLÄ°: Eksikleri 711 ayrÄ± istekle tek tek yeniden denemiyoruz.
-    # Bu davranÄ±Å Yahoo rate-limitini tetikliyordu. Eksikler ikinci bir kÃ¼Ã§Ã¼k toplu turda denenir.
-    retry=[s for s in dict.fromkeys(failed) if s not in out]
+    # Yalniz hic cache'i olmayan eksikleri bir kez daha, 5'li gruplarda dene.
+    retry=[s for s in dict.fromkeys(failed) if s not in stale_cache and s not in out]
     if retry:
-        print(f'[YF] ikinci_toplu_tur={len(retry)}')
-        time.sleep(max(10.0,YF_BACKOFF_BASE))
-        for bi,batch in enumerate(chunks(retry,max(5,YF_BATCH_SIZE//2)),1):
+        print(f'[YF] missing_retry={len(retry)}')
+        time.sleep(max(YF_BACKOFF_BASE,60.0))
+        for batch in chunks(retry,max(2,min(5,YF_BATCH_SIZE))):
             data=_yf_download_with_retry(batch,period=period,group_by='ticker')
             if data is not None and len(data)>0:
                 for sym in batch:
-                    if sym in out:
-                        continue
                     df=_extract_yf_frame(data,sym,batch)
                     if df is not None and len(df)>=25:
                         out[sym]=df
-            time.sleep(YF_BATCH_PAUSE*1.5)
-    print(f'[YF] toplam_veri_ok={len(out)}/{len(yf_symbols)}')
+                        _cache_save(sym,df)
+            time.sleep(max(YF_BATCH_PAUSE,8.0))
+
+    # Refresh basarisiz olsa bile eski cache silinmez; out zaten onu tasiyor.
+    print(f'[YF] total_data_ok={len(out)}/{len(yf_symbols)} newly_missing={sum(1 for s in yf_symbols if s not in out)}')
     return out
+
+def download_index(period='6mo'):
+    # Endeks de ayni cache/backoff mantigini kullanir.
+    cached,age_h=_cache_load(INDEX_SYMBOL,allow_stale=True)
+    if cached is not None and _cache_is_fresh(age_h):
+        print('[YF INDEX] fresh cache')
+        return cached
+    data=_yf_download_with_retry(INDEX_SYMBOL,period=period,group_by='column')
+    if data is not None and len(data)>0:
+        if isinstance(data.columns,pd.MultiIndex):
+            extracted=None
+            for level in range(data.columns.nlevels):
+                if INDEX_SYMBOL in set(map(str,data.columns.get_level_values(level))):
+                    try:
+                        extracted=data.xs(INDEX_SYMBOL,axis=1,level=level)
+                        break
+                    except Exception:
+                        pass
+            if extracted is not None:
+                data=extracted
+        if len(data)>=25:
+            _cache_save(INDEX_SYMBOL,data)
+            return data
+    if cached is not None:
+        print('[YF INDEX] refresh failed, stale cache used')
+        return cached
+    return pd.DataFrame()
 
 def rsi(series,n=14):
     d=series.diff(); g=d.clip(lower=0); l=-d.clip(upper=0)
@@ -528,22 +620,7 @@ def run_once():
     yfs=[f'{x}.IS' for x in codes]
     print('[BIST] sembol',len(codes))
 
-    idx=_yf_download_with_retry(INDEX_SYMBOL,period='6mo',group_by='column')
-    if idx is None:
-        idx=pd.DataFrame()
-    if isinstance(idx.columns,pd.MultiIndex):
-        # XU100.IS hangi seviyedeyse oradan Ã§Ä±kar.
-        extracted=None
-        for level in range(idx.columns.nlevels):
-            if INDEX_SYMBOL in set(map(str,idx.columns.get_level_values(level))):
-                try:
-                    extracted=idx.xs(INDEX_SYMBOL,axis=1,level=level)
-                    break
-                except Exception:
-                    pass
-        if extracted is not None:
-            idx=extracted
-
+    idx=download_index('6mo')
     frames=download_daily(yfs,'6mo')
     saved=good=0
     for code in codes:
@@ -584,7 +661,7 @@ def should_run(c):
     return now.hour>RUN_AFTER_HOUR or (now.hour==RUN_AFTER_HOUR and now.minute>=RUN_AFTER_MINUTE)
 
 def main():
-    setup(); print('BIST TAVAN ÃÄRENEN BOT V1.2 YF RATE LIMIT FIX',DB_PATH)
+    setup(); print('BIST TAVAN OGRENEN BOT V1.3 CACHE + RESUME',DB_PATH)
     tg('ð§  BIST TAVAN ÃÄRENEN BOT BAÅLADI\nSadece BIST100 deÄil, KAP iÃ§indeki BIST Åirketlerinin tamamÄ±nÄ± izleyecek.\nHedef: Her gÃ¼n tavan gÃ¶renleri bulup, tavan olmadan Ã¶nce diÄer hisselerden hangi Ã¶zelliklerle ayrÄ±ldÄ±klarÄ±nÄ± Ã¶Ärenmek.\nÄ°lk aÅamada AL/SAT mesajÄ± yok.')
     while True:
         c=db()
