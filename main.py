@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, re, time, math, sqlite3, itertools
+import os, re, time, math, sqlite3, itertools, json
 from datetime import datetime, timedelta, timezone
 import requests, pandas as pd, numpy as np, yfinance as yf
 from bs4 import BeautifulSoup
@@ -24,30 +24,47 @@ YF_MAX_RETRIES=int(os.getenv('YF_MAX_RETRIES','3'))
 YF_BACKOFF_BASE=float(os.getenv('YF_BACKOFF_BASE','5.0'))
 
 def fix_text(s):
-    if not isinstance(s,str): s=str(s)
-    if any(x in s for x in ('Ã','Ã','Ã','Ã°','Ã','Ã¢')):
-        try:s=s.encode('latin1').decode('utf-8')
-        except:pass
+    if not isinstance(s, str):
+        s = str(s)
+    # Mesaj daha once UTF-8 -> Latin-1/Windows-1252 olarak bozulduysa
+    # en fazla 3 tur onarmayi dene. Dogru Turkce metne dokunmaz.
+    markers = ('Ã', 'Ã', 'Ã', 'Ã°', 'Ã', 'Ã¢')
+    for _ in range(3):
+        if not any(x in s for x in markers):
+            break
+        repaired = None
+        for enc in ('latin1', 'cp1252'):
+            try:
+                repaired = s.encode(enc).decode('utf-8')
+                break
+            except Exception:
+                pass
+        if repaired is None or repaired == s:
+            break
+        s = repaired
     return s
 
 def tg(msg):
-    # Python iÃ§indeki metni Unicode olarak koru ve Telegram'a UTF-8 JSON gÃ¶nder.
-    # Form-data bazÄ± ortamlarda TÃ¼rkÃ§e karakter/emojilerin mojibake gÃ¶rÃ¼nmesine yol aÃ§abiliyor.
-    if not isinstance(msg, str):
-        msg = str(msg)
+    # Once olasi mojibake'i duzelt. Sonra tum Turkce karakterleri ve emojileri
+    # ASCII JSON icindeki \uXXXX kacislarina cevir. Boylece Railway/GitHub/HTTP
+    # katmanlarinda karakter kodlamasi degisse bile Telegram metni dogru cozer.
+    msg = fix_text(msg)
     if not BOT_TOKEN:
         print('[TELEGRAM YOK]'); print(msg); return False
-    ok=False
+    ok = False
     for cid in CHAT_IDS:
         try:
-            r=requests.post(
+            payload = json.dumps({'chat_id': cid, 'text': msg}, ensure_ascii=True).encode('ascii')
+            r = requests.post(
                 f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
-                json={'chat_id':cid,'text':msg},
-                headers={'Content-Type':'application/json; charset=utf-8'},
+                data=payload,
+                headers={'Content-Type':'application/json'},
                 timeout=20
             )
-            print('[TELEGRAM OK]' if r.ok else '[TELEGRAM HATA]',cid,r.text[:200]); ok=ok or r.ok
-        except Exception as e: print('[TELEGRAM EXC]',cid,e)
+            print('[TELEGRAM OK]' if r.ok else '[TELEGRAM HATA]', cid, r.text[:200])
+            ok = ok or r.ok
+        except Exception as e:
+            print('[TELEGRAM EXC]', cid, e)
     return ok
 
 def db():
