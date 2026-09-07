@@ -7,7 +7,17 @@ from bs4 import BeautifulSoup
 LOCAL_TZ=timezone(timedelta(hours=3))
 BOT_TOKEN=(os.getenv('BOT_TOKEN','') or os.getenv('TELEGRAM_BOT_TOKEN','')).strip()
 CHAT_IDS=[int(x.strip()) for x in os.getenv('CHAT_IDS','2097448038').split(',') if x.strip()]
-DATA_DIR=os.getenv('DATA_DIR','.').strip() or '.'
+# Railway Volume varsa cache/DB'yi kalici mount'a yaz; yoksa DATA_DIR veya mevcut klasor.
+_VOLUME_DIR=(os.getenv('RAILWAY_VOLUME_MOUNT_PATH','') or '').strip()
+_DATA_DIR_ENV=(os.getenv('DATA_DIR','') or '').strip()
+if _VOLUME_DIR:
+    DATA_DIR=_VOLUME_DIR
+elif _DATA_DIR_ENV:
+    DATA_DIR=_DATA_DIR_ENV
+elif os.path.isdir('/data'):
+    DATA_DIR='/data'
+else:
+    DATA_DIR='.'
 os.makedirs(DATA_DIR,exist_ok=True)
 DB_PATH=os.path.join(DATA_DIR,'bist_tavan_learning.db')
 KAP_BIST_URL='https://www.kap.org.tr/tr/bist-sirketler'
@@ -18,10 +28,13 @@ LOOP_SECONDS=900
 RUN_AFTER_HOUR=18
 RUN_AFTER_MINUTE=20
 MIN_COMBO_N=12
-YF_BATCH_SIZE=int(os.getenv('YF_BATCH_SIZE','10'))
-YF_BATCH_PAUSE=float(os.getenv('YF_BATCH_PAUSE','8.0'))
-YF_MAX_RETRIES=int(os.getenv('YF_MAX_RETRIES','3'))
-YF_BACKOFF_BASE=float(os.getenv('YF_BACKOFF_BASE','60.0'))
+YF_BATCH_SIZE=max(2,min(10,int(os.getenv('YF_BATCH_SIZE','10'))))
+YF_BATCH_PAUSE=max(12.0,float(os.getenv('YF_BATCH_PAUSE','12.0')))
+YF_MAX_RETRIES=max(1,min(3,int(os.getenv('YF_MAX_RETRIES','3'))))
+# Railway'de eski 15 sn degiskeni kalsa bile minimum 60 sn'den asagi inme.
+YF_BACKOFF_BASE=max(60.0,float(os.getenv('YF_BACKOFF_BASE','60.0')))
+YF_CIRCUIT_COOLDOWN=max(300.0,float(os.getenv('YF_CIRCUIT_COOLDOWN','300')))
+YF_CIRCUIT_FILE=os.path.join(DATA_DIR,'yf_rate_limit_until.txt')
 YF_CACHE_MAX_AGE_HOURS=float(os.getenv('YF_CACHE_MAX_AGE_HOURS','20'))
 YF_CACHE_DIR=os.path.join(DATA_DIR,'yf_cache')
 os.makedirs(YF_CACHE_DIR,exist_ok=True)
@@ -143,7 +156,7 @@ def kap_bist_kodlari():
     codes=sorted(codes)
     if len(codes)<250:
         raise RuntimeError(f'KAP sembol parse yetersiz: {len(codes)}')
-    print(f'[KAP] gerÃ§ek sembol adedi={len(codes)}')
+    print(f'[KAP] gercek sembol adedi={len(codes)}')
     return codes
 
 def symbol_list(c):
@@ -228,7 +241,34 @@ def _is_rate_limit_error(exc):
     t=str(exc).lower()
     return ('ratelimit' in t or 'rate limit' in t or 'too many requests' in t or '429' in t)
 
+def _circuit_until_get():
+    try:
+        if not os.path.exists(YF_CIRCUIT_FILE):
+            return 0.0
+        return float(open(YF_CIRCUIT_FILE,'r',encoding='ascii').read().strip() or 0)
+    except Exception:
+        return 0.0
+
+def _circuit_trip(seconds=None):
+    wait=max(YF_CIRCUIT_COOLDOWN, float(seconds or 0))
+    until=time.time()+wait
+    try:
+        with open(YF_CIRCUIT_FILE,'w',encoding='ascii') as f:
+            f.write(str(until))
+    except Exception:
+        pass
+    print(f'[YF CIRCUIT] Yahoo rate limit; global cooldown={wait:.0f}s')
+    return until
+
+def _circuit_wait_if_needed():
+    until=_circuit_until_get()
+    remain=until-time.time()
+    if remain>0:
+        print(f'[YF CIRCUIT] cooldown active; sleep={remain:.0f}s')
+        time.sleep(remain)
+
 def _yf_download_with_retry(symbols,period='6mo',group_by='ticker'):
+    _circuit_wait_if_needed()
     last_exc=None
     for attempt in range(1,YF_MAX_RETRIES+1):
         try:
@@ -241,14 +281,22 @@ def _yf_download_with_retry(symbols,period='6mo',group_by='ticker'):
             last_exc=RuntimeError('Yahoo returned empty data')
         except Exception as e:
             last_exc=e
+
+        is_rate=last_exc is not None and _is_rate_limit_error(last_exc)
+        if is_rate:
+            # Ilk 429'da yuzlerce sembolu denemeye devam etme. Global devre kesici ac.
+            wait=YF_BACKOFF_BASE*(2**(attempt-1))
+            _circuit_trip(max(YF_CIRCUIT_COOLDOWN,wait))
+            if attempt < YF_MAX_RETRIES:
+                _circuit_wait_if_needed()
+                continue
+            break
+
         if attempt < YF_MAX_RETRIES:
-            if last_exc is not None and _is_rate_limit_error(last_exc):
-                wait=YF_BACKOFF_BASE*(2**(attempt-1))
-                print(f'[YF RATE LIMIT] attempt={attempt}/{YF_MAX_RETRIES} sleep={wait:.0f}s')
-            else:
-                wait=min(15.0*attempt,45.0)
-                print(f'[YF RETRY] attempt={attempt}/{YF_MAX_RETRIES} sleep={wait:.0f}s err={str(last_exc)[:100]}')
+            wait=min(15.0*attempt,45.0)
+            print(f'[YF RETRY] attempt={attempt}/{YF_MAX_RETRIES} sleep={wait:.0f}s err={str(last_exc)[:100]}')
             time.sleep(wait)
+
     if last_exc:
         print('[YF GROUP FAILED]',str(last_exc)[:180])
     return None
@@ -280,6 +328,12 @@ def download_daily(yf_symbols,period='6mo'):
         data=_yf_download_with_retry(batch,period=period,group_by='ticker')
         if data is None or len(data)==0:
             failed.extend(batch)
+            # Rate limit devresi aciksa kalan yuzlerce grubu zorlamayi birak.
+            if _circuit_until_get()>time.time():
+                remaining=[x for later in batches[bi:] for x in later]
+                failed.extend(remaining)
+                print(f'[YF CIRCUIT] remaining batches skipped={len(remaining)}; stale cache will be used')
+                break
         else:
             for sym in batch:
                 df=_extract_yf_frame(data,sym,batch)
@@ -294,7 +348,7 @@ def download_daily(yf_symbols,period='6mo'):
 
     # Yalniz hic cache'i olmayan eksikleri bir kez daha, 5'li gruplarda dene.
     retry=[s for s in dict.fromkeys(failed) if s not in stale_cache and s not in out]
-    if retry:
+    if retry and _circuit_until_get()<=time.time():
         print(f'[YF] missing_retry={len(retry)}')
         time.sleep(max(YF_BACKOFF_BASE,60.0))
         for batch in chunks(retry,max(2,min(5,YF_BATCH_SIZE))):
@@ -661,7 +715,7 @@ def should_run(c):
     return now.hour>RUN_AFTER_HOUR or (now.hour==RUN_AFTER_HOUR and now.minute>=RUN_AFTER_MINUTE)
 
 def main():
-    setup(); print('BIST TAVAN OGRENEN BOT V1.3 CACHE + RESUME',DB_PATH)
+    setup(); print('BIST TAVAN OGRENEN BOT V1.4 CACHE + CIRCUIT + VOLUME',DB_PATH)
     tg('ð§  BIST TAVAN ÃÄRENEN BOT BAÅLADI\nSadece BIST100 deÄil, KAP iÃ§indeki BIST Åirketlerinin tamamÄ±nÄ± izleyecek.\nHedef: Her gÃ¼n tavan gÃ¶renleri bulup, tavan olmadan Ã¶nce diÄer hisselerden hangi Ã¶zelliklerle ayrÄ±ldÄ±klarÄ±nÄ± Ã¶Ärenmek.\nÄ°lk aÅamada AL/SAT mesajÄ± yok.')
     while True:
         c=db()
