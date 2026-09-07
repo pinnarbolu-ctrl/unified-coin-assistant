@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os, re, time, math, sqlite3, itertools
 from datetime import datetime, timedelta, timezone
 import requests, pandas as pd, numpy as np, yfinance as yf
@@ -30,13 +31,21 @@ def fix_text(s):
     return s
 
 def tg(msg):
-    msg=fix_text(msg)
+    # Python iÃ§indeki metni Unicode olarak koru ve Telegram'a UTF-8 JSON gÃ¶nder.
+    # Form-data bazÄ± ortamlarda TÃ¼rkÃ§e karakter/emojilerin mojibake gÃ¶rÃ¼nmesine yol aÃ§abiliyor.
+    if not isinstance(msg, str):
+        msg = str(msg)
     if not BOT_TOKEN:
         print('[TELEGRAM YOK]'); print(msg); return False
     ok=False
     for cid in CHAT_IDS:
         try:
-            r=requests.post(f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',data={'chat_id':cid,'text':msg},timeout=20)
+            r=requests.post(
+                f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
+                json={'chat_id':cid,'text':msg},
+                headers={'Content-Type':'application/json; charset=utf-8'},
+                timeout=20
+            )
             print('[TELEGRAM OK]' if r.ok else '[TELEGRAM HATA]',cid,r.text[:200]); ok=ok or r.ok
         except Exception as e: print('[TELEGRAM EXC]',cid,e)
     return ok
@@ -343,6 +352,110 @@ def combo_lifts(c,lookback_days=60):
             rate=h/n; out.append({'name':' + '.join(names),'n':n,'rate':rate,'lift':rate/base if base else 0})
     out.sort(key=lambda x:(x['lift'],x['rate'],x['n']),reverse=True); return out[:8]
 
+
+
+def tavan_vs_yukselip_kalan(c,lookback_days=60,near_low=5.0):
+    """Tavan yapanlarÄ±, ertesi gÃ¼n en az %5 yÃ¼kselip tavan eÅiÄine ulaÅamayanlardan ayÄ±rÄ±r."""
+    md=c.execute('select max(day) from daily_features').fetchone()[0]
+    if not md:
+        return 0,0,[]
+    since=(datetime.fromisoformat(md)-timedelta(days=lookback_days)).date().isoformat()
+    tavan_n=c.execute('select count(*) from daily_features where day>=? and next_tavan_hit=1',(since,)).fetchone()[0] or 0
+    near_n=c.execute('select count(*) from daily_features where day>=? and next_tavan_hit=0 and next_high_pct>=? and next_high_pct<?',(since,near_low,TAVAN_HIT_PCT)).fetchone()[0] or 0
+    out=[]
+    if tavan_n<30 or near_n<30:
+        return tavan_n,near_n,out
+    for col in FEATURE_COLS:
+        tv=c.execute(f'select {col} from daily_features where day>=? and next_tavan_hit=1 and {col} is not null',(since,)).fetchall()
+        nr=c.execute(f'select {col} from daily_features where day>=? and next_tavan_hit=0 and next_high_pct>=? and next_high_pct<? and {col} is not null',(since,near_low,TAVAN_HIT_PCT)).fetchall()
+        a=np.array([float(x[0]) for x in tv if x[0] is not None and math.isfinite(float(x[0]))],dtype=float)
+        b=np.array([float(x[0]) for x in nr if x[0] is not None and math.isfinite(float(x[0]))],dtype=float)
+        if len(a)<30 or len(b)<30:
+            continue
+        ma=float(np.mean(a)); mb=float(np.mean(b))
+        va=float(np.var(a,ddof=1)) if len(a)>1 else 0.0
+        vb=float(np.var(b,ddof=1)) if len(b)>1 else 0.0
+        pooled=math.sqrt(max(((len(a)-1)*va+(len(b)-1)*vb)/(len(a)+len(b)-2),0.0)) if len(a)+len(b)>2 else 0.0
+        effect=(ma-mb)/pooled if pooled>1e-12 else 0.0
+        out.append({'feature':col,'tavan_mean':ma,'near_mean':mb,'effect':effect,'n_tavan':len(a),'n_near':len(b)})
+    out.sort(key=lambda x:abs(x['effect']),reverse=True)
+    return tavan_n,near_n,out[:10]
+
+
+def seri_tavan_ogrenme(c,lookback_days=60):
+    """
+    Ä°lk tavan baÅlamadan ÃNCEKÄ° gÃ¼nÃ¼n Ã¶zelliklerinden, ilk tavandan sonra
+    2. ve 3. iÅlem gÃ¼nÃ¼nde de tavan gÃ¶rÃ¼lÃ¼p gÃ¶rÃ¼lmeyeceÄini Ã¶Ärenir.
+
+    Veri sÄ±zÄ±ntÄ±sÄ±nÄ± Ã¶nlemek iÃ§in Ã¶zellikler yalnÄ±z seri baÅlamadan Ã¶nceki
+    satÄ±rdan alÄ±nÄ±r. `next_tavan_hit` ertesi iÅlem gÃ¼nÃ¼nÃ¼n tavan etiketidir.
+    """
+    md=c.execute('select max(day) from daily_features').fetchone()[0]
+    if not md:
+        return {'first_n':0,'serial2_n':0,'serial3_n':0,'single_n':0,'sep2':[],'sep3':[]}
+
+    max_day=datetime.fromisoformat(md).date()
+    since=(max_day-timedelta(days=lookback_days)).isoformat()
+    # Ä°lk tavanÄ±n bir Ã¶nceki gÃ¼nÃ¼nÃ¼ ve sonraki 2 iÅlem gÃ¼nÃ¼nÃ¼ doÄru kurabilmek
+    # iÃ§in rapor penceresinden biraz daha eski satÄ±rlarÄ± da oku.
+    pad_since=(max_day-timedelta(days=lookback_days+20)).isoformat()
+    cols=['code','day','next_tavan_hit',*FEATURE_COLS]
+    q=f"select {','.join(cols)} from daily_features where day>=? order by code,day"
+    df=pd.read_sql_query(q,c,params=(pad_since,))
+    if df.empty:
+        return {'first_n':0,'serial2_n':0,'serial3_n':0,'single_n':0,'sep2':[],'sep3':[]}
+
+    df['next_tavan_hit']=pd.to_numeric(df['next_tavan_hit'],errors='coerce').fillna(0).astype(int)
+    g=df.groupby('code',sort=False)['next_tavan_hit']
+    # Bir satÄ±rÄ±n prev_hit'i, o gÃ¼nÃ¼n kendisinin tavan olup olmadÄ±ÄÄ±nÄ± temsil eder.
+    df['prev_hit']=g.shift(1).fillna(0).astype(int)
+    df['hit_after_1']=g.shift(-1).fillna(0).astype(int)
+    df['hit_after_2']=g.shift(-2).fillna(0).astype(int)
+
+    # day satÄ±rÄ±nÄ±n ertesi gÃ¼nÃ¼ ilk tavan olsun; day'in kendisi tavan olmasÄ±n.
+    starts=df[(df['day']>=since) & (df['next_tavan_hit']==1) & (df['prev_hit']!=1)].copy()
+    if starts.empty:
+        return {'first_n':0,'serial2_n':0,'serial3_n':0,'single_n':0,'sep2':[],'sep3':[]}
+
+    starts['serial2']=(starts['hit_after_1']==1)
+    starts['serial3']=(starts['hit_after_1']==1) & (starts['hit_after_2']==1)
+    starts['single']=(starts['hit_after_1']!=1)
+
+    first_n=int(len(starts))
+    serial2_n=int(starts['serial2'].sum())
+    serial3_n=int(starts['serial3'].sum())
+    single_n=int(starts['single'].sum())
+
+    def ayir(mask_a,mask_b,min_a=20,min_b=20):
+        a_df=starts[mask_a]
+        b_df=starts[mask_b]
+        if len(a_df)<min_a or len(b_df)<min_b:
+            return []
+        out=[]
+        for col in FEATURE_COLS:
+            a=pd.to_numeric(a_df[col],errors='coerce').replace([np.inf,-np.inf],np.nan).dropna().to_numpy(dtype=float)
+            b=pd.to_numeric(b_df[col],errors='coerce').replace([np.inf,-np.inf],np.nan).dropna().to_numpy(dtype=float)
+            if len(a)<min_a or len(b)<min_b:
+                continue
+            ma=float(np.mean(a)); mb=float(np.mean(b))
+            va=float(np.var(a,ddof=1)) if len(a)>1 else 0.0
+            vb=float(np.var(b,ddof=1)) if len(b)>1 else 0.0
+            denom=len(a)+len(b)-2
+            pooled=math.sqrt(max(((len(a)-1)*va+(len(b)-1)*vb)/denom,0.0)) if denom>0 else 0.0
+            effect=(ma-mb)/pooled if pooled>1e-12 else 0.0
+            out.append({'feature':col,'a_mean':ma,'b_mean':mb,'effect':effect,'n_a':len(a),'n_b':len(b)})
+        out.sort(key=lambda x:abs(x['effect']),reverse=True)
+        return out[:10]
+
+    # 2+ seri yapanlarÄ±, ilk tavandan sonra duranlardan ayÄ±r.
+    sep2=ayir(starts['serial2'],starts['single'],20,20)
+    # 3+ seri yapanlarÄ±, 1-2 tavanda kalanlardan ayÄ±r. 3+ Ã¶rnekleri daha az olabilir.
+    sep3=ayir(starts['serial3'],~starts['serial3'],12,20)
+    return {
+        'first_n':first_n,'serial2_n':serial2_n,'serial3_n':serial3_n,'single_n':single_n,
+        'sep2':sep2,'sep3':sep3
+    }
+
 def report(c):
     total,hits,findings=feature_lifts(c,60); combos=combo_lifts(c,60); base=hits/total if total else 0
     lines=['ð BIST TAVAN ÃÄRENME RAPORU','',f'Son 60 gÃ¼nde tavan gÃ¶rme oranÄ±: %{base*100:.2f} ({hits}/{total})']
@@ -354,7 +467,42 @@ def report(c):
     if combos:
         lines+=['','ð§© En gÃ¼Ã§lÃ¼ tavan-Ã¶ncesi kombinasyonlar:']
         for x in combos[:5]: lines.append(f"â¢ {x['name']} â tavan %{x['rate']*100:.2f}, bazÄ±n {x['lift']:.2f}x (n={x['n']})")
-    lines+=['','Not: Ä°lk aÅamada AL sinyali yok; amaÃ§ tavan yapanlarÄ±n yapmayanlardan gerÃ§ek farkÄ±nÄ± Ã¶Ärenmek.']
+
+    tavan_n,near_n,sep=tavan_vs_yukselip_kalan(c,60,5.0)
+    if sep:
+        lines+=['',f'ð¬ Tavan yapanÄ± yalnÄ±z %5â{TAVAN_HIT_PCT:.1f} yÃ¼kselip kalanlardan ayÄ±ranlar (tavan n={tavan_n}, diÄer n={near_n}):']
+        for x in sep[:5]:
+            yon='daha yÃ¼ksek' if x['effect']>0 else 'daha dÃ¼ÅÃ¼k'
+            lines.append(f"â¢ {feature_label(x['feature'])}: tavan ort. {x['tavan_mean']:.2f} | %5â{TAVAN_HIT_PCT:.1f} kalan ort. {x['near_mean']:.2f} â tavanda {yon} (ayrÄ±m {abs(x['effect']):.2f}Ï)")
+    elif tavan_n or near_n:
+        lines+=['',f'ð¬ Tavan / %5â{TAVAN_HIT_PCT:.1f} karÅÄ±laÅtÄ±rmasÄ± iÃ§in Ã¶rnek henÃ¼z yetersiz (tavan n={tavan_n}, diÄer n={near_n}).']
+
+    seri=seri_tavan_ogrenme(c,60)
+    if seri['first_n']:
+        r2=seri['serial2_n']/seri['first_n']*100
+        r3=seri['serial3_n']/seri['first_n']*100
+        lines+=['','ð¥ SERÄ° TAVAN ÃÄRENMESÄ°',
+                f"Ä°lk tavan adaylarÄ±nÄ±n sayÄ±sÄ±: {seri['first_n']}",
+                f"Ä°lk tavandan sonra 2. iÅlem gÃ¼nÃ¼nde de tavan: %{r2:.2f} ({seri['serial2_n']}/{seri['first_n']})",
+                f"3+ iÅlem gÃ¼nÃ¼ seri tavan: %{r3:.2f} ({seri['serial3_n']}/{seri['first_n']})"]
+        if seri['sep2']:
+            lines+=['','ð§¬ 2+ tavan yapanÄ± tek tavanda kalandan ayÄ±ran ilk-tavan Ã¶ncesi Ã¶zellikler:']
+            for x in seri['sep2'][:5]:
+                yon='daha yÃ¼ksek' if x['effect']>0 else 'daha dÃ¼ÅÃ¼k'
+                lines.append(f"â¢ {feature_label(x['feature'])}: seri ort. {x['a_mean']:.2f} | tek tavan ort. {x['b_mean']:.2f} â seride {yon} (ayrÄ±m {abs(x['effect']):.2f}Ï)")
+        else:
+            lines+=['',f"ð§¬ 2+ / tek tavan ayrÄ±mÄ± iÃ§in Ã¶rnek henÃ¼z yetersiz (2+ n={seri['serial2_n']}, tek n={seri['single_n']})."]
+        if seri['sep3']:
+            lines+=['','ð 3+ seri tavanÄ± 1â2 tavanda kalandan ayÄ±ran ilk-tavan Ã¶ncesi Ã¶zellikler:']
+            for x in seri['sep3'][:5]:
+                yon='daha yÃ¼ksek' if x['effect']>0 else 'daha dÃ¼ÅÃ¼k'
+                lines.append(f"â¢ {feature_label(x['feature'])}: 3+ seri ort. {x['a_mean']:.2f} | diÄer ort. {x['b_mean']:.2f} â 3+ seride {yon} (ayrÄ±m {abs(x['effect']):.2f}Ï)")
+        elif seri['serial3_n']:
+            lines+=['',f"ð 3+ seri tavan ayrÄ±mÄ± iÃ§in Ã¶rnek henÃ¼z yetersiz (3+ n={seri['serial3_n']})."]
+    else:
+        lines+=['','ð¥ Seri tavan Ã¶Ärenmesi iÃ§in henÃ¼z yeterli ilk-tavan Ã¶rneÄi yok.']
+
+    lines+=['','Not: Ä°lk aÅamada AL sinyali yok; amaÃ§ tavan yapanlarÄ±n, yarÄ±da kalanlarÄ±n ve seri tavan yapanlarÄ±n gerÃ§ek farkÄ±nÄ± Ã¶Ärenmek.']
     return '\n'.join(lines)
 
 def run_once():
