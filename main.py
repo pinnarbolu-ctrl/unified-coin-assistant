@@ -1,778 +1,1417 @@
-# -*- coding: utf-8 -*-
-import os, re, time, math, sqlite3, itertools, json
-from datetime import datetime, timedelta, timezone
-import requests, pandas as pd, numpy as np, yfinance as yf
-from bs4 import BeautifulSoup
+# ==========================================
+# AI COIN ASSISTANT
+# Fast Scan V1: 60 sn hızlı ön tarama + 5 dk tam tarama
+# AL Relax V1: normal AL için ADX 27 / AI 80
+# Final Cleanup / Core Candidate Scanner
+# Candidate thresholds synced with latest working Coin Radar
+# ==========================================
 
-LOCAL_TZ=timezone(timedelta(hours=3))
-BOT_TOKEN=(os.getenv('BOT_TOKEN','') or os.getenv('TELEGRAM_BOT_TOKEN','')).strip()
-CHAT_IDS=[int(x.strip()) for x in os.getenv('CHAT_IDS','2097448038').split(',') if x.strip()]
-# Railway Volume varsa cache/DB'yi kalici mount'a yaz; yoksa DATA_DIR veya mevcut klasor.
-_VOLUME_DIR=(os.getenv('RAILWAY_VOLUME_MOUNT_PATH','') or '').strip()
-_DATA_DIR_ENV=(os.getenv('DATA_DIR','') or '').strip()
-if _VOLUME_DIR:
-    DATA_DIR=_VOLUME_DIR
-elif _DATA_DIR_ENV:
-    DATA_DIR=_DATA_DIR_ENV
-elif os.path.isdir('/data'):
-    DATA_DIR='/data'
-else:
-    DATA_DIR='.'
-os.makedirs(DATA_DIR,exist_ok=True)
-DB_PATH=os.path.join(DATA_DIR,'bist_tavan_learning.db')
-KAP_BIST_URL='https://www.kap.org.tr/tr/bist-sirketler'
-INDEX_SYMBOL='XU100.IS'
-TAVAN_HIT_PCT=9.50
-TAVAN_CLOSE_PCT=9.25
-LOOP_SECONDS=900
-RUN_AFTER_HOUR=18
-RUN_AFTER_MINUTE=20
-MIN_COMBO_N=12
-YF_BATCH_SIZE=max(2,min(10,int(os.getenv('YF_BATCH_SIZE','10'))))
-YF_BATCH_PAUSE=max(12.0,float(os.getenv('YF_BATCH_PAUSE','12.0')))
-YF_MAX_RETRIES=max(1,min(3,int(os.getenv('YF_MAX_RETRIES','3'))))
-# Railway'de eski 15 sn degiskeni kalsa bile minimum 60 sn'den asagi inme.
-YF_BACKOFF_BASE=max(60.0,float(os.getenv('YF_BACKOFF_BASE','60.0')))
-YF_CIRCUIT_COOLDOWN=max(300.0,float(os.getenv('YF_CIRCUIT_COOLDOWN','300')))
-YF_CIRCUIT_FILE=os.path.join(DATA_DIR,'yf_rate_limit_until.txt')
-YF_CACHE_MAX_AGE_HOURS=float(os.getenv('YF_CACHE_MAX_AGE_HOURS','20'))
-YF_CACHE_DIR=os.path.join(DATA_DIR,'yf_cache')
-os.makedirs(YF_CACHE_DIR,exist_ok=True)
-YF_INVALID_FILE=os.path.join(DATA_DIR,'yf_invalid_symbols.json')
+import os
+import time
+import requests
+import feedparser
+import json
 
-def fix_text(s):
-    if not isinstance(s, str):
-        s = str(s)
-    # Mesaj daha once UTF-8 -> Latin-1/Windows-1252 olarak bozulduysa
-    # en fazla 3 tur onarmayi dene. Dogru Turkce metne dokunmaz.
-    markers = ('Ã', 'Ã', 'Ã', 'Ã°', 'Ã', 'Ã¢')
-    for _ in range(3):
-        if not any(x in s for x in markers):
-            break
-        repaired = None
-        for enc in ('latin1', 'cp1252'):
-            try:
-                repaired = s.encode(enc).decode('utf-8')
-                break
-            except Exception:
-                pass
-        if repaired is None or repaired == s:
-            break
-        s = repaired
-    return s
 
-def tg(msg):
-    # Once olasi mojibake'i duzelt. Sonra tum Turkce karakterleri ve emojileri
-    # ASCII JSON icindeki \uXXXX kacislarina cevir. Boylece Railway/GitHub/HTTP
-    # katmanlarinda karakter kodlamasi degisse bile Telegram metni dogru cozer.
-    msg = fix_text(msg)
-    if not BOT_TOKEN:
-        print('[TELEGRAM YOK]'); print(msg); return False
-    ok = False
-    for cid in CHAT_IDS:
-        try:
-            payload = json.dumps({'chat_id': cid, 'text': msg}, ensure_ascii=True).encode('ascii')
-            r = requests.post(
-                f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
-                data=payload,
-                headers={'Content-Type':'application/json'},
-                timeout=20
-            )
-            print('[TELEGRAM OK]' if r.ok else '[TELEGRAM HATA]', cid, r.text[:200])
-            ok = ok or r.ok
-        except Exception as e:
-            print('[TELEGRAM EXC]', cid, e)
-    return ok
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-def db():
-    c=sqlite3.connect(DB_PATH,timeout=60)
-    c.execute('PRAGMA journal_mode=WAL'); c.execute('PRAGMA synchronous=NORMAL')
-    return c
+CHAT_IDS = [
+    2097448038,
+]
 
-def meta_get(c,k):
-    r=c.execute('select value from meta where key=?',(k,)).fetchone()
-    return r[0] if r else None
+TARAMA_SURESI = 60
+TAM_TARAMA_DONGUSU = 5          # 5 x 60 sn = yaklaşık 5 dk
+HIZLI_HAREKET_ESIGI = 0.40      # 1 dakikalık fiyat değişimi %0.40+ ise hemen derin analiz
+son_fiyatlar = {}
+tarama_sayaci = 0
 
-def meta_set(c,k,v):
-    c.execute('insert into meta(key,value) values(?,?) on conflict(key) do update set value=excluded.value',(k,str(v)))
+# Early Capture V1: önceki taramadaki hızlanmayı ölçmek için hafıza.
+onceki_tarama = {}
 
-def setup():
-    c=db()
-    c.execute('create table if not exists meta(key text primary key,value text)')
-    c.execute('create table if not exists symbols(code text primary key,yf_symbol text not null,first_seen text,last_seen text)')
-    c.execute('''create table if not exists daily_features(
-      code text not null,day text not null,close real,high real,low real,open real,volume real,
-      ret1 real,ret3 real,ret5 real,ret10 real,vol_ratio5 real,vol_ratio20 real,
-      range5 real,range20 real,compression5 real,rsi14 real,atr14_pct real,
-      dist_high20 real,dist_high50 real,green3 integer,green5 integer,
-      index_ret1 real,index_ret5 real,rel1 real,rel5 real,prev_tavan20 integer,
-      next_high_pct real,next_close_pct real,next_tavan_hit integer,next_tavan_close integer,
-      primary key(code,day))''')
-    c.execute('create index if not exists ix_day on daily_features(day)')
-    c.execute('create index if not exists ix_hit on daily_features(next_tavan_hit,day)')
-    if meta_get(c,'last_run_day') is None: meta_set(c,'last_run_day','')
-    if meta_get(c,'start_day') is None: meta_set(c,'start_day',datetime.now(LOCAL_TZ).date().isoformat())
-    c.commit(); c.close()
+# Çoklu Güç Havuzu:
+# Güçlenme işareti veren coin 5 dakika boyunca, 1 dk fiyat hareketi %0.40 altında kalsa bile izlenir.
+guc_izleme_havuzu = {}
+GUC_IZLEME_SURESI = 5 * 60
 
-def kap_bist_kodlari():
-    """KAP BIST Åirketleri tablosunun yalnÄ±zca 'Kod' sÃ¼tununu okur.
-    Eski sÃ¼rÃ¼m tÃ¼m sayfadaki bÃ¼yÃ¼k harfli kelimeleri sembol sanabildiÄi iÃ§in
-    Åehir/Ã¼nvan kelimeleri Yahoo'ya ticker olarak gÃ¶nderilebiliyordu.
-    """
-    r=requests.get(
-        KAP_BIST_URL,
-        headers={'User-Agent':'Mozilla/5.0 (compatible; BISTLearningBot/1.1)'},
-        timeout=30
-    )
-    r.raise_for_status()
-    soup=BeautifulSoup(r.text,'html.parser')
+# Aynı kararın tekrar Telegram gönderimini engeller.
+son_ai_kararlar = {}
 
-    codes=set()
+# 24 SAATLİK +%5 YAKALAMA BAŞARI RAPORU
+# Karşılaştırma adil olsun diye diğer Assistant testleriyle aynı mantık:
+# her AL sinyali 3 saat izlenir; 24 saatte bir o pencerenin +%5 başarı oranı raporlanır.
+YUZDE5_IZLEME_SURESI = 3 * 60 * 60
+YUZDE5_RAPOR_ARALIGI = 24 * 60 * 60
+YUZDE5_RAPOR_ETIKETI = "MAIN13 ÇOKLU GÜÇ HAVUZU"
 
-    # Ãnce gerÃ§ek tablo satÄ±rlarÄ±nÄ± kullan.
-    for tr in soup.find_all('tr'):
-        tds=tr.find_all('td')
-        if not tds:
-            continue
-        raw=tds[0].get_text(' ',strip=True).upper()
-        # KAP'ta bazÄ± iÅlem gÃ¶rmeyen/Ã¶zel kurum kodlarÄ±nda boÅluk olabiliyor.
-        # Yahoo BIST hisseleri iÃ§in tek parÃ§a 3-6 karakterli kodlarÄ± al.
-        if re.fullmatch(r'[A-Z0-9]{3,6}',raw):
-            codes.add(raw)
+_STATE_DIR = "/data" if os.path.isdir("/data") else "."
+_YUZDE5_KAYIT_DOSYA = os.path.join(_STATE_DIR, "main13_yuzde5_kayitlari.json")
+_YUZDE5_META_DOSYA = os.path.join(_STATE_DIR, "main13_yuzde5_meta.json")
 
-    # KAP gÃ¶rÃ¼nÃ¼mÃ¼ tablo etiketi kullanmazsa Åirket link metinlerinden yedekle.
-    if len(codes)<250:
-        for a in soup.find_all('a'):
-            raw=a.get_text(' ',strip=True).upper()
-            href=(a.get('href') or '').lower()
-            if ('sirket' in href or 'company' in href) and re.fullmatch(r'[A-Z0-9]{3,6}',raw):
-                codes.add(raw)
 
-    # Son emniyet: yalnÄ±zca satÄ±r baÅÄ±nda kod + Åirket Ã¼nvanÄ± kalÄ±bÄ±nÄ± yakala.
-    if len(codes)<250:
-        page=soup.get_text('\n',strip=True)
-        for m in re.finditer(r'(?m)^([A-Z0-9]{3,6})\s*$',page):
-            codes.add(m.group(1))
-
-    codes=sorted(codes)
-    if len(codes)<250:
-        raise RuntimeError(f'KAP sembol parse yetersiz: {len(codes)}')
-    print(f'[KAP] gercek sembol adedi={len(codes)}')
-    return codes
-
-def symbol_list(c):
+def _json_yukle(path, varsayilan):
     try:
-        codes=kap_bist_kodlari(); today=datetime.now(LOCAL_TZ).date().isoformat()
-        for code in codes:
-            c.execute('''insert into symbols(code,yf_symbol,first_seen,last_seen) values(?,?,?,?)
-                         on conflict(code) do update set last_seen=excluded.last_seen''',(code,f'{code}.IS',today,today))
-        c.commit(); return codes
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                veri = json.load(f)
+                return veri
     except Exception as e:
-        print('[KAP LISTE HATA]',e)
-        rows=c.execute('select code from symbols order by code').fetchall()
-        if rows:return [r[0] for r in rows]
-        env=[x.strip().upper() for x in os.getenv('BIST_SYMBOLS','').split(',') if x.strip()]
-        if env:return env
-        raise
-
-def chunks(seq,n):
-    for i in range(0,len(seq),n): yield seq[i:i+n]
-
-def _extract_yf_frame(data,sym,batch):
-    if data is None or len(data)==0:
-        return None
-    if isinstance(data.columns,pd.MultiIndex):
-        # yfinance sÃ¼rÃ¼mÃ¼ne gÃ¶re ticker 0. veya 1. seviyede gelebilir.
-        for level in range(data.columns.nlevels):
-            vals=set(map(str,data.columns.get_level_values(level)))
-            if sym in vals:
-                try:
-                    df=data.xs(sym,axis=1,level=level).copy().dropna(how='all')
-                    if not df.empty:
-                        return df
-                except Exception:
-                    pass
-        return None
-    if len(batch)==1:
-        df=data.copy().dropna(how='all')
-        return df if not df.empty else None
-    return None
+        print("+%5 state okunamadı:", e)
+    return varsayilan
 
 
-
-def _invalid_load():
+def _json_kaydet(path, veri):
     try:
-        if not os.path.exists(YF_INVALID_FILE):
-            return {}
-        with open(YF_INVALID_FILE,'r',encoding='utf-8') as f:
-            obj=json.load(f)
-        return obj if isinstance(obj,dict) else {}
+        klasor = os.path.dirname(os.path.abspath(path))
+        if klasor:
+            os.makedirs(klasor, exist_ok=True)
+        gecici = path + ".tmp"
+        with open(gecici, "w", encoding="utf-8") as f:
+            json.dump(veri, f, ensure_ascii=False)
+        os.replace(gecici, path)
     except Exception as e:
-        print('[YF INVALID READ ERROR]',str(e)[:120])
-        return {}
-
-def _invalid_save(obj):
-    tmp=YF_INVALID_FILE+'.tmp'
-    try:
-        with open(tmp,'w',encoding='utf-8') as f:
-            json.dump(obj,f,ensure_ascii=False,indent=2,sort_keys=True)
-        os.replace(tmp,YF_INVALID_FILE)
-        return True
-    except Exception as e:
-        print('[YF INVALID WRITE ERROR]',str(e)[:120])
-        try:
-            if os.path.exists(tmp): os.remove(tmp)
-        except Exception: pass
-        return False
-
-def _invalid_mark(sym,reason='no_data'):
-    obj=_invalid_load()
-    if sym not in obj:
-        obj[sym]={'reason':reason,'first_seen':datetime.now(LOCAL_TZ).isoformat(timespec='seconds')}
-        _invalid_save(obj)
-        print(f'[YF INVALID] {sym} marked; reason={reason}')
-
-def _invalid_set():
-    return set(_invalid_load().keys())
-
-def _cache_path(sym):
-    safe=re.sub(r'[^A-Za-z0-9_.-]+','_',sym)
-    return os.path.join(YF_CACHE_DIR,safe+'.pkl')
-
-def _cache_load(sym, allow_stale=True):
-    path=_cache_path(sym)
-    if not os.path.exists(path):
-        return None, None
-    try:
-        age_h=max(0.0,(time.time()-os.path.getmtime(path))/3600.0)
-        if (not allow_stale) and age_h>YF_CACHE_MAX_AGE_HOURS:
-            return None, age_h
-        df=pd.read_pickle(path)
-        if df is None or len(df)<25:
-            return None, age_h
-        return df, age_h
-    except Exception as e:
-        print('[YF CACHE READ ERROR]',sym,str(e)[:120])
-        return None, None
-
-def _cache_save(sym,df):
-    if df is None or len(df)<25:
-        return False
-    path=_cache_path(sym)
-    tmp=path+'.tmp'
-    try:
-        df.to_pickle(tmp)
-        os.replace(tmp,path)
-        return True
-    except Exception as e:
-        print('[YF CACHE WRITE ERROR]',sym,str(e)[:120])
-        try:
-            if os.path.exists(tmp): os.remove(tmp)
-        except Exception: pass
-        return False
-
-def _cache_is_fresh(age_h):
-    return age_h is not None and age_h<=YF_CACHE_MAX_AGE_HOURS
-
-def _is_rate_limit_error(exc):
-    t=str(exc).lower()
-    return ('ratelimit' in t or 'rate limit' in t or 'too many requests' in t or '429' in t)
-
-def _circuit_until_get():
-    try:
-        if not os.path.exists(YF_CIRCUIT_FILE):
-            return 0.0
-        return float(open(YF_CIRCUIT_FILE,'r',encoding='ascii').read().strip() or 0)
-    except Exception:
-        return 0.0
-
-def _circuit_trip(seconds=None):
-    wait=max(YF_CIRCUIT_COOLDOWN, float(seconds or 0))
-    until=time.time()+wait
-    try:
-        with open(YF_CIRCUIT_FILE,'w',encoding='ascii') as f:
-            f.write(str(until))
-    except Exception:
-        pass
-    print(f'[YF CIRCUIT] Yahoo rate limit; global cooldown={wait:.0f}s')
-    return until
-
-def _circuit_wait_if_needed():
-    until=_circuit_until_get()
-    remain=until-time.time()
-    if remain>0:
-        print(f'[YF CIRCUIT] cooldown active; sleep={remain:.0f}s')
-        time.sleep(remain)
-
-def _yf_download_with_retry(symbols,period='6mo',group_by='ticker'):
-    _circuit_wait_if_needed()
-    last_exc=None
-    for attempt in range(1,YF_MAX_RETRIES+1):
-        try:
-            data=yf.download(
-                symbols,period=period,interval='1d',auto_adjust=False,
-                group_by=group_by,threads=False,progress=False,timeout=45
-            )
-            if data is not None and len(data)>0:
-                return data
-            last_exc=RuntimeError('Yahoo returned empty data')
-        except Exception as e:
-            last_exc=e
-
-        is_rate=last_exc is not None and _is_rate_limit_error(last_exc)
-        if is_rate:
-            # Ilk 429'da yuzlerce sembolu denemeye devam etme. Global devre kesici ac.
-            wait=YF_BACKOFF_BASE*(2**(attempt-1))
-            _circuit_trip(max(YF_CIRCUIT_COOLDOWN,wait))
-            if attempt < YF_MAX_RETRIES:
-                _circuit_wait_if_needed()
-                continue
-            break
-
-        if attempt < YF_MAX_RETRIES:
-            wait=min(15.0*attempt,45.0)
-            print(f'[YF RETRY] attempt={attempt}/{YF_MAX_RETRIES} sleep={wait:.0f}s err={str(last_exc)[:100]}')
-            time.sleep(wait)
-
-    if last_exc:
-        print('[YF GROUP FAILED]',str(last_exc)[:180])
-    return None
-
-def download_daily(yf_symbols,period='6mo'):
-    # 1) Cache'i once yukle. Taze cache icin Yahoo'ya hic istek atma.
-    # 2) Daha once kesin 'veri yok' olarak isaretlenen sembolleri Yahoo'ya tekrar sorma.
-    # 3) Yalniz eksik veya bayat sembolleri yavas gruplar halinde yenile.
-    # 4) Yahoo rate-limit verirse bayat cache'i kullanmaya devam et.
-    out={}
-    stale_cache={}
-    need_refresh=[]
-    invalid=_invalid_set()
-    if invalid:
-        print(f'[YF INVALID] skipped={len(invalid)}')
-    for sym in yf_symbols:
-        if sym in invalid:
-            continue
-        df,age_h=_cache_load(sym,allow_stale=True)
-        if df is not None:
-            out[sym]=df
-            stale_cache[sym]=df
-        if df is None or not _cache_is_fresh(age_h):
-            need_refresh.append(sym)
-
-    eligible_total=sum(1 for x in yf_symbols if x not in invalid)
-    fresh_count=eligible_total-len(need_refresh)
-    print(f'[YF CACHE] total={len(yf_symbols)} invalid={len(invalid)} fresh={fresh_count} refresh={len(need_refresh)} cached_any={len(out)}')
-    if not need_refresh:
-        print(f'[YF] cache_only ok={len(out)}/{len(yf_symbols)}')
-        return out
-
-    batches=list(chunks(need_refresh,YF_BATCH_SIZE))
-    failed=[]
-    for bi,batch in enumerate(batches,1):
-        data=_yf_download_with_retry(batch,period=period,group_by='ticker')
-        if data is None or len(data)==0:
-            failed.extend(batch)
-            # Rate limit devresi aciksa kalan yuzlerce grubu zorlamayi birak.
-            if _circuit_until_get()>time.time():
-                remaining=[x for later in batches[bi:] for x in later]
-                failed.extend(remaining)
-                print(f'[YF CIRCUIT] remaining batches skipped={len(remaining)}; stale cache will be used')
-                break
-        else:
-            for sym in batch:
-                df=_extract_yf_frame(data,sym,batch)
-                if df is not None and len(df)>=25:
-                    out[sym]=df
-                    _cache_save(sym,df)
-                else:
-                    failed.append(sym)
-                    # Grup cevabi geldi ama bu sembol icin 25+ mumluk veri yoksa
-                    # bunu kalici 'veri yok/delist' listesine al. Rate-limit/grup
-                    # hatalarinda bu blok calismaz, dolayisiyla gecici hata blacklist olmaz.
-                    _invalid_mark(sym,'no_data_or_delisted')
-                    invalid.add(sym)
-        print(f'[YF] batch={bi}/{len(batches)} cache+new_ok={len(out)} refresh_fail={len(set(failed))}')
-        if bi < len(batches):
-            time.sleep(YF_BATCH_PAUSE)
-
-    # Yalniz hic cache'i olmayan eksikleri bir kez daha, 5'li gruplarda dene.
-    retry=[s for s in dict.fromkeys(failed) if s not in stale_cache and s not in out and s not in invalid]
-    if retry and _circuit_until_get()<=time.time():
-        print(f'[YF] missing_retry={len(retry)}')
-        time.sleep(max(YF_BACKOFF_BASE,60.0))
-        for batch in chunks(retry,max(2,min(5,YF_BATCH_SIZE))):
-            data=_yf_download_with_retry(batch,period=period,group_by='ticker')
-            if data is not None and len(data)>0:
-                for sym in batch:
-                    df=_extract_yf_frame(data,sym,batch)
-                    if df is not None and len(df)>=25:
-                        out[sym]=df
-                        _cache_save(sym,df)
-            time.sleep(max(YF_BATCH_PAUSE,8.0))
-
-    # Refresh basarisiz olsa bile eski cache silinmez; out zaten onu tasiyor.
-    print(f'[YF] total_data_ok={len(out)}/{eligible_total} invalid_skipped={len(invalid)} newly_missing={sum(1 for s in yf_symbols if s not in out and s not in invalid)}')
-    return out
-
-def download_index(period='6mo'):
-    # Endeks de ayni cache/backoff mantigini kullanir.
-    cached,age_h=_cache_load(INDEX_SYMBOL,allow_stale=True)
-    if cached is not None and _cache_is_fresh(age_h):
-        print('[YF INDEX] fresh cache')
-        return cached
-    data=_yf_download_with_retry(INDEX_SYMBOL,period=period,group_by='column')
-    if data is not None and len(data)>0:
-        if isinstance(data.columns,pd.MultiIndex):
-            extracted=None
-            for level in range(data.columns.nlevels):
-                if INDEX_SYMBOL in set(map(str,data.columns.get_level_values(level))):
-                    try:
-                        extracted=data.xs(INDEX_SYMBOL,axis=1,level=level)
-                        break
-                    except Exception:
-                        pass
-            if extracted is not None:
-                data=extracted
-        if len(data)>=25:
-            _cache_save(INDEX_SYMBOL,data)
-            return data
-    if cached is not None:
-        print('[YF INDEX] refresh failed, stale cache used')
-        return cached
-    return pd.DataFrame()
-
-def rsi(series,n=14):
-    d=series.diff(); g=d.clip(lower=0); l=-d.clip(upper=0)
-    ag=g.ewm(alpha=1/n,adjust=False,min_periods=n).mean(); al=l.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
-    rs=ag/al.replace(0,np.nan); return 100-(100/(1+rs))
-
-def atr_pct(df,n=14):
-    prev=df['Close'].shift(1)
-    tr=pd.concat([(df['High']-df['Low']).abs(),(df['High']-prev).abs(),(df['Low']-prev).abs()],axis=1).max(axis=1)
-    return tr.rolling(n).mean()/df['Close']*100
-
-FEATURE_COLS=['ret1','ret3','ret5','ret10','vol_ratio5','vol_ratio20','range5','range20','compression5','rsi14','atr14_pct','dist_high20','dist_high50','green3','green5','index_ret1','index_ret5','rel1','rel5','prev_tavan20']
-
-FEATURE_LABELS={
-    "ret1":"1 gÃ¼nlÃ¼k momentum",
-    "ret3":"3 gÃ¼nlÃ¼k momentum",
-    "ret5":"5 gÃ¼nlÃ¼k momentum",
-    "ret10":"10 gÃ¼nlÃ¼k momentum",
-    "vol_ratio5":"Hacim / 5 gÃ¼nlÃ¼k ortalama",
-    "vol_ratio20":"Hacim / 20 gÃ¼nlÃ¼k ortalama",
-    "range5":"5 gÃ¼nlÃ¼k fiyat aralÄ±ÄÄ±",
-    "range20":"20 gÃ¼nlÃ¼k fiyat aralÄ±ÄÄ±",
-    "compression5":"5 gÃ¼nlÃ¼k sÄ±kÄ±Åma oranÄ±",
-    "rsi14":"RSI (14)",
-    "atr14_pct":"ATR (14) yÃ¼zdesi",
-    "dist_high20":"20 gÃ¼nlÃ¼k zirveye uzaklÄ±k",
-    "dist_high50":"50 gÃ¼nlÃ¼k zirveye uzaklÄ±k",
-    "green3":"Son 3 gÃ¼nde yeÅil gÃ¼n sayÄ±sÄ±",
-    "green5":"Son 5 gÃ¼nde yeÅil gÃ¼n sayÄ±sÄ±",
-    "index_ret1":"BIST 100 1 gÃ¼nlÃ¼k deÄiÅim",
-    "index_ret5":"BIST 100 5 gÃ¼nlÃ¼k deÄiÅim",
-    "rel1":"Hissenin BIST 100'e gÃ¶re 1 gÃ¼nlÃ¼k gÃ¼cÃ¼",
-    "rel5":"Hissenin BIST 100'e gÃ¶re 5 gÃ¼nlÃ¼k gÃ¼cÃ¼",
-    "prev_tavan20":"Son 20 gÃ¼nde tavan sayÄ±sÄ±",
-}
-
-def feature_label(col):
-    return FEATURE_LABELS.get(col,col)
-
-def features_for_symbol(code,df,index_df):
-    if df is None or len(df)<25:return []
-    df=df.copy(); df.columns=[str(x) for x in df.columns]
-    need=['Open','High','Low','Close','Volume']
-    if not all(x in df.columns for x in need):return []
-    for col in need:df[col]=pd.to_numeric(df[col],errors='coerce')
-    df=df.dropna(subset=['Close'])
-    if len(df)<25:return []
-    close=df['Close']; vol=df['Volume'].replace(0,np.nan)
-    ret1=close.pct_change(1)*100; ret3=close.pct_change(3)*100; ret5=close.pct_change(5)*100; ret10=close.pct_change(10)*100
-    vr5=vol/vol.shift(1).rolling(5).mean(); vr20=vol/vol.shift(1).rolling(20).mean()
-    hi5=df['High'].rolling(5).max(); lo5=df['Low'].rolling(5).min(); hi20=df['High'].rolling(20).max(); lo20=df['Low'].rolling(20).min(); hi50=df['High'].rolling(50).max()
-    range5=(hi5/lo5-1)*100; range20=(hi20/lo20-1)*100; comp=range5/range20.replace(0,np.nan)
-    rsi14=rsi(close,14); atr14=atr_pct(df,14); dh20=(close/hi20-1)*100; dh50=(close/hi50-1)*100
-    green=(close>close.shift(1)).astype(int); g3=green.rolling(3).sum(); g5=green.rolling(5).sum()
-    day_high_pct=(df['High']/close.shift(1)-1)*100; prev_tavan=(day_high_pct>=TAVAN_HIT_PCT).astype(int).shift(1).rolling(20).sum()
-    idx1=pd.Series(index=df.index,dtype=float); idx5=pd.Series(index=df.index,dtype=float)
-    if index_df is not None and not index_df.empty and 'Close' in index_df.columns:
-        ic=pd.to_numeric(index_df['Close'],errors='coerce'); idx1=ic.pct_change(1).reindex(df.index)*100; idx5=ic.pct_change(5).reindex(df.index)*100
-    def v(s,i):
-        x=s.iloc[i]
-        return None if pd.isna(x) or not math.isfinite(float(x)) else float(x)
-    rows=[]
-    for i in range(20,len(df)-1):
-        c0=float(close.iloc[i]); c1=float(close.iloc[i+1]); h1=float(df['High'].iloc[i+1])
-        nh=(h1/c0-1)*100 if c0 else None; nc=(c1/c0-1)*100 if c0 else None
-        ir1=v(idx1,i); ir5=v(idx5,i); rr1=v(ret1,i); rr5=v(ret5,i)
-        rows.append({'code':code,'day':pd.Timestamp(df.index[i]).date().isoformat(),'close':c0,'high':float(df['High'].iloc[i]),'low':float(df['Low'].iloc[i]),'open':float(df['Open'].iloc[i]),'volume':float(df['Volume'].iloc[i] or 0),
-                     'ret1':rr1,'ret3':v(ret3,i),'ret5':rr5,'ret10':v(ret10,i),'vol_ratio5':v(vr5,i),'vol_ratio20':v(vr20,i),'range5':v(range5,i),'range20':v(range20,i),'compression5':v(comp,i),
-                     'rsi14':v(rsi14,i),'atr14_pct':v(atr14,i),'dist_high20':v(dh20,i),'dist_high50':v(dh50,i),'green3':int(g3.iloc[i]) if not pd.isna(g3.iloc[i]) else None,'green5':int(g5.iloc[i]) if not pd.isna(g5.iloc[i]) else None,
-                     'index_ret1':ir1,'index_ret5':ir5,'rel1':None if rr1 is None or ir1 is None else rr1-ir1,'rel5':None if rr5 is None or ir5 is None else rr5-ir5,'prev_tavan20':int(prev_tavan.iloc[i]) if not pd.isna(prev_tavan.iloc[i]) else 0,
-                     'next_high_pct':nh,'next_close_pct':nc,'next_tavan_hit':1 if nh>=TAVAN_HIT_PCT else 0,'next_tavan_close':1 if nc>=TAVAN_CLOSE_PCT else 0})
-    return rows
-
-def save_rows(c,rows):
-    cols=['code','day','close','high','low','open','volume',*FEATURE_COLS,'next_high_pct','next_close_pct','next_tavan_hit','next_tavan_close']
-    q=','.join('?' for _ in cols); colstr=','.join(cols); n=0
-    for r in rows:
-        c.execute(f'insert or replace into daily_features({colstr}) values({q})',[r.get(x) for x in cols]); n+=1
-    return n
-
-def feature_lifts(c,lookback_days=60):
-    md=c.execute('select max(day) from daily_features').fetchone()[0]
-    if not md:return 0,0,[]
-    since=(datetime.fromisoformat(md)-timedelta(days=lookback_days)).date().isoformat()
-    total,hits=c.execute('select count(*),sum(next_tavan_hit) from daily_features where day>=?',(since,)).fetchone(); total=total or 0; hits=hits or 0; base=hits/total if total else 0
-    findings=[]
-    for col in FEATURE_COLS:
-        vals=c.execute(f'select {col},next_tavan_hit from daily_features where day>=? and {col} is not null',(since,)).fetchall()
-        if len(vals)<100:continue
-        arr=np.array([float(v) for v,_ in vals]); q1,q2,q3=np.quantile(arr,[.25,.5,.75])
-        for name,lo,hi in [('dÃ¼ÅÃ¼k',None,q1),('orta-alt',q1,q2),('orta-Ã¼st',q2,q3),('yÃ¼ksek',q3,None)]:
-            ss=[int(h or 0) for v,h in vals if (lo is None or float(v)>=lo) and (hi is None or float(v)<hi)]
-            if len(ss)<30:continue
-            rate=sum(ss)/len(ss); findings.append({'feature':col,'lo':lo,'hi':hi,'n':len(ss),'rate':rate,'lift':rate/base if base else 0})
-    findings.sort(key=lambda x:(x['lift'],x['rate'],x['n']),reverse=True)
-    return total,hits,findings[:12]
-
-def where_from(f):
-    col,lo,hi=f['feature'],f['lo'],f['hi']
-    etiket=feature_label(col)
-    if lo is None:return f'{col}<{hi}',f'{etiket} < {hi:.2f}'
-    if hi is None:return f'{col}>={lo}',f'{etiket} â¥ {lo:.2f}'
-    return f'{col}>={lo} and {col}<{hi}',f'{etiket} {lo:.2f}-{hi:.2f}'
-
-def combo_lifts(c,lookback_days=60):
-    total,hits,top=feature_lifts(c,lookback_days)
-    if not total:return []
-    md=c.execute('select max(day) from daily_features').fetchone()[0]; since=(datetime.fromisoformat(md)-timedelta(days=lookback_days)).date().isoformat(); base=hits/total if total else 0
-    selected=[]; seen=set()
-    for f in top:
-        if f['feature'] in seen:continue
-        seen.add(f['feature']); selected.append(f)
-        if len(selected)>=8:break
-    out=[]
-    for k in (2,3):
-        for items in itertools.combinations(selected,k):
-            wh=[]; names=[]
-            for f in items:
-                w,n=where_from(f); wh.append(w); names.append(n)
-            n,h=c.execute(f"select count(*),sum(next_tavan_hit) from daily_features where day>=? and {' and '.join(wh)}",(since,)).fetchone(); n=n or 0; h=h or 0
-            if n<MIN_COMBO_N:continue
-            rate=h/n; out.append({'name':' + '.join(names),'n':n,'rate':rate,'lift':rate/base if base else 0})
-    out.sort(key=lambda x:(x['lift'],x['rate'],x['n']),reverse=True); return out[:8]
+        print("+%5 state yazılamadı:", e)
 
 
+YUZDE5_KAYITLARI = _json_yukle(_YUZDE5_KAYIT_DOSYA, [])
+YUZDE5_META = _json_yukle(_YUZDE5_META_DOSYA, {})
 
-def tavan_vs_yukselip_kalan(c,lookback_days=60,near_low=5.0):
-    """Tavan yapanlarÄ±, ertesi gÃ¼n en az %5 yÃ¼kselip tavan eÅiÄine ulaÅamayanlardan ayÄ±rÄ±r."""
-    md=c.execute('select max(day) from daily_features').fetchone()[0]
-    if not md:
-        return 0,0,[]
-    since=(datetime.fromisoformat(md)-timedelta(days=lookback_days)).date().isoformat()
-    tavan_n=c.execute('select count(*) from daily_features where day>=? and next_tavan_hit=1',(since,)).fetchone()[0] or 0
-    near_n=c.execute('select count(*) from daily_features where day>=? and next_tavan_hit=0 and next_high_pct>=? and next_high_pct<?',(since,near_low,TAVAN_HIT_PCT)).fetchone()[0] or 0
-    out=[]
-    if tavan_n<30 or near_n<30:
-        return tavan_n,near_n,out
-    for col in FEATURE_COLS:
-        tv=c.execute(f'select {col} from daily_features where day>=? and next_tavan_hit=1 and {col} is not null',(since,)).fetchall()
-        nr=c.execute(f'select {col} from daily_features where day>=? and next_tavan_hit=0 and next_high_pct>=? and next_high_pct<? and {col} is not null',(since,near_low,TAVAN_HIT_PCT)).fetchall()
-        a=np.array([float(x[0]) for x in tv if x[0] is not None and math.isfinite(float(x[0]))],dtype=float)
-        b=np.array([float(x[0]) for x in nr if x[0] is not None and math.isfinite(float(x[0]))],dtype=float)
-        if len(a)<30 or len(b)<30:
-            continue
-        ma=float(np.mean(a)); mb=float(np.mean(b))
-        va=float(np.var(a,ddof=1)) if len(a)>1 else 0.0
-        vb=float(np.var(b,ddof=1)) if len(b)>1 else 0.0
-        pooled=math.sqrt(max(((len(a)-1)*va+(len(b)-1)*vb)/(len(a)+len(b)-2),0.0)) if len(a)+len(b)>2 else 0.0
-        effect=(ma-mb)/pooled if pooled>1e-12 else 0.0
-        out.append({'feature':col,'tavan_mean':ma,'near_mean':mb,'effect':effect,'n_tavan':len(a),'n_near':len(b)})
-    out.sort(key=lambda x:abs(x['effect']),reverse=True)
-    return tavan_n,near_n,out[:10]
+if not isinstance(YUZDE5_KAYITLARI, list):
+    YUZDE5_KAYITLARI = []
+if not isinstance(YUZDE5_META, dict):
+    YUZDE5_META = {}
+
+if not YUZDE5_META.get("baslangic"):
+    _simdi = time.time()
+    YUZDE5_META["baslangic"] = _simdi
+    YUZDE5_META["son_rapor"] = _simdi
+    _json_kaydet(_YUZDE5_META_DOSYA, YUZDE5_META)
 
 
-def seri_tavan_ogrenme(c,lookback_days=60):
-    """
-    Ä°lk tavan baÅlamadan ÃNCEKÄ° gÃ¼nÃ¼n Ã¶zelliklerinden, ilk tavandan sonra
-    2. ve 3. iÅlem gÃ¼nÃ¼nde de tavan gÃ¶rÃ¼lÃ¼p gÃ¶rÃ¼lmeyeceÄini Ã¶Ärenir.
-
-    Veri sÄ±zÄ±ntÄ±sÄ±nÄ± Ã¶nlemek iÃ§in Ã¶zellikler yalnÄ±z seri baÅlamadan Ã¶nceki
-    satÄ±rdan alÄ±nÄ±r. `next_tavan_hit` ertesi iÅlem gÃ¼nÃ¼nÃ¼n tavan etiketidir.
-    """
-    md=c.execute('select max(day) from daily_features').fetchone()[0]
-    if not md:
-        return {'first_n':0,'serial2_n':0,'serial3_n':0,'single_n':0,'sep2':[],'sep3':[]}
-
-    max_day=datetime.fromisoformat(md).date()
-    since=(max_day-timedelta(days=lookback_days)).isoformat()
-    # Ä°lk tavanÄ±n bir Ã¶nceki gÃ¼nÃ¼nÃ¼ ve sonraki 2 iÅlem gÃ¼nÃ¼nÃ¼ doÄru kurabilmek
-    # iÃ§in rapor penceresinden biraz daha eski satÄ±rlarÄ± da oku.
-    pad_since=(max_day-timedelta(days=lookback_days+20)).isoformat()
-    cols=['code','day','next_tavan_hit',*FEATURE_COLS]
-    q=f"select {','.join(cols)} from daily_features where day>=? order by code,day"
-    df=pd.read_sql_query(q,c,params=(pad_since,))
-    if df.empty:
-        return {'first_n':0,'serial2_n':0,'serial3_n':0,'single_n':0,'sep2':[],'sep3':[]}
-
-    df['next_tavan_hit']=pd.to_numeric(df['next_tavan_hit'],errors='coerce').fillna(0).astype(int)
-    g=df.groupby('code',sort=False)['next_tavan_hit']
-    # Bir satÄ±rÄ±n prev_hit'i, o gÃ¼nÃ¼n kendisinin tavan olup olmadÄ±ÄÄ±nÄ± temsil eder.
-    df['prev_hit']=g.shift(1).fillna(0).astype(int)
-    df['hit_after_1']=g.shift(-1).fillna(0).astype(int)
-    df['hit_after_2']=g.shift(-2).fillna(0).astype(int)
-
-    # day satÄ±rÄ±nÄ±n ertesi gÃ¼nÃ¼ ilk tavan olsun; day'in kendisi tavan olmasÄ±n.
-    starts=df[(df['day']>=since) & (df['next_tavan_hit']==1) & (df['prev_hit']!=1)].copy()
-    if starts.empty:
-        return {'first_n':0,'serial2_n':0,'serial3_n':0,'single_n':0,'sep2':[],'sep3':[]}
-
-    starts['serial2']=(starts['hit_after_1']==1)
-    starts['serial3']=(starts['hit_after_1']==1) & (starts['hit_after_2']==1)
-    starts['single']=(starts['hit_after_1']!=1)
-
-    first_n=int(len(starts))
-    serial2_n=int(starts['serial2'].sum())
-    serial3_n=int(starts['serial3'].sum())
-    single_n=int(starts['single'].sum())
-
-    def ayir(mask_a,mask_b,min_a=20,min_b=20):
-        a_df=starts[mask_a]
-        b_df=starts[mask_b]
-        if len(a_df)<min_a or len(b_df)<min_b:
-            return []
-        out=[]
-        for col in FEATURE_COLS:
-            a=pd.to_numeric(a_df[col],errors='coerce').replace([np.inf,-np.inf],np.nan).dropna().to_numpy(dtype=float)
-            b=pd.to_numeric(b_df[col],errors='coerce').replace([np.inf,-np.inf],np.nan).dropna().to_numpy(dtype=float)
-            if len(a)<min_a or len(b)<min_b:
-                continue
-            ma=float(np.mean(a)); mb=float(np.mean(b))
-            va=float(np.var(a,ddof=1)) if len(a)>1 else 0.0
-            vb=float(np.var(b,ddof=1)) if len(b)>1 else 0.0
-            denom=len(a)+len(b)-2
-            pooled=math.sqrt(max(((len(a)-1)*va+(len(b)-1)*vb)/denom,0.0)) if denom>0 else 0.0
-            effect=(ma-mb)/pooled if pooled>1e-12 else 0.0
-            out.append({'feature':col,'a_mean':ma,'b_mean':mb,'effect':effect,'n_a':len(a),'n_b':len(b)})
-        out.sort(key=lambda x:abs(x['effect']),reverse=True)
-        return out[:10]
-
-    # 2+ seri yapanlarÄ±, ilk tavandan sonra duranlardan ayÄ±r.
-    sep2=ayir(starts['serial2'],starts['single'],20,20)
-    # 3+ seri yapanlarÄ±, 1-2 tavanda kalanlardan ayÄ±r. 3+ Ã¶rnekleri daha az olabilir.
-    sep3=ayir(starts['serial3'],~starts['serial3'],12,20)
-    return {
-        'first_n':first_n,'serial2_n':serial2_n,'serial3_n':serial3_n,'single_n':single_n,
-        'sep2':sep2,'sep3':sep3
-    }
-
-def report(c):
-    total,hits,findings=feature_lifts(c,60); combos=combo_lifts(c,60); base=hits/total if total else 0
-    lines=['ð BIST TAVAN ÃÄRENME RAPORU','',f'Son 60 gÃ¼nde tavan gÃ¶rme oranÄ±: %{base*100:.2f} ({hits}/{total})']
-    if findings:
-        lines+=['','ð§  Tavan Ã¶ncesinde Ã¶ne Ã§Ä±kan tekil Ã¶zellikler:']
-        for f in findings[:5]:
-            rng=f"<{f['hi']:.2f}" if f['lo'] is None else (f">={f['lo']:.2f}" if f['hi'] is None else f"{f['lo']:.2f}-{f['hi']:.2f}")
-            lines.append(f"â¢ {feature_label(f['feature'])} {rng} â tavan %{f['rate']*100:.2f}, bazÄ±n {f['lift']:.2f}x (n={f['n']})")
-    if combos:
-        lines+=['','ð§© En gÃ¼Ã§lÃ¼ tavan-Ã¶ncesi kombinasyonlar:']
-        for x in combos[:5]: lines.append(f"â¢ {x['name']} â tavan %{x['rate']*100:.2f}, bazÄ±n {x['lift']:.2f}x (n={x['n']})")
-
-    tavan_n,near_n,sep=tavan_vs_yukselip_kalan(c,60,5.0)
-    if sep:
-        lines+=['',f'ð¬ Tavan yapanÄ± yalnÄ±z %5â{TAVAN_HIT_PCT:.1f} yÃ¼kselip kalanlardan ayÄ±ranlar (tavan n={tavan_n}, diÄer n={near_n}):']
-        for x in sep[:5]:
-            yon='daha yÃ¼ksek' if x['effect']>0 else 'daha dÃ¼ÅÃ¼k'
-            lines.append(f"â¢ {feature_label(x['feature'])}: tavan ort. {x['tavan_mean']:.2f} | %5â{TAVAN_HIT_PCT:.1f} kalan ort. {x['near_mean']:.2f} â tavanda {yon} (ayrÄ±m {abs(x['effect']):.2f}Ï)")
-    elif tavan_n or near_n:
-        lines+=['',f'ð¬ Tavan / %5â{TAVAN_HIT_PCT:.1f} karÅÄ±laÅtÄ±rmasÄ± iÃ§in Ã¶rnek henÃ¼z yetersiz (tavan n={tavan_n}, diÄer n={near_n}).']
-
-    seri=seri_tavan_ogrenme(c,60)
-    if seri['first_n']:
-        r2=seri['serial2_n']/seri['first_n']*100
-        r3=seri['serial3_n']/seri['first_n']*100
-        lines+=['','ð¥ SERÄ° TAVAN ÃÄRENMESÄ°',
-                f"Ä°lk tavan adaylarÄ±nÄ±n sayÄ±sÄ±: {seri['first_n']}",
-                f"Ä°lk tavandan sonra 2. iÅlem gÃ¼nÃ¼nde de tavan: %{r2:.2f} ({seri['serial2_n']}/{seri['first_n']})",
-                f"3+ iÅlem gÃ¼nÃ¼ seri tavan: %{r3:.2f} ({seri['serial3_n']}/{seri['first_n']})"]
-        if seri['sep2']:
-            lines+=['','ð§¬ 2+ tavan yapanÄ± tek tavanda kalandan ayÄ±ran ilk-tavan Ã¶ncesi Ã¶zellikler:']
-            for x in seri['sep2'][:5]:
-                yon='daha yÃ¼ksek' if x['effect']>0 else 'daha dÃ¼ÅÃ¼k'
-                lines.append(f"â¢ {feature_label(x['feature'])}: seri ort. {x['a_mean']:.2f} | tek tavan ort. {x['b_mean']:.2f} â seride {yon} (ayrÄ±m {abs(x['effect']):.2f}Ï)")
-        else:
-            lines+=['',f"ð§¬ 2+ / tek tavan ayrÄ±mÄ± iÃ§in Ã¶rnek henÃ¼z yetersiz (2+ n={seri['serial2_n']}, tek n={seri['single_n']})."]
-        if seri['sep3']:
-            lines+=['','ð 3+ seri tavanÄ± 1â2 tavanda kalandan ayÄ±ran ilk-tavan Ã¶ncesi Ã¶zellikler:']
-            for x in seri['sep3'][:5]:
-                yon='daha yÃ¼ksek' if x['effect']>0 else 'daha dÃ¼ÅÃ¼k'
-                lines.append(f"â¢ {feature_label(x['feature'])}: 3+ seri ort. {x['a_mean']:.2f} | diÄer ort. {x['b_mean']:.2f} â 3+ seride {yon} (ayrÄ±m {abs(x['effect']):.2f}Ï)")
-        elif seri['serial3_n']:
-            lines+=['',f"ð 3+ seri tavan ayrÄ±mÄ± iÃ§in Ã¶rnek henÃ¼z yetersiz (3+ n={seri['serial3_n']})."]
-    else:
-        lines+=['','ð¥ Seri tavan Ã¶Ärenmesi iÃ§in henÃ¼z yeterli ilk-tavan Ã¶rneÄi yok.']
-
-    lines+=['','Not: Ä°lk aÅamada AL sinyali yok; amaÃ§ tavan yapanlarÄ±n, yarÄ±da kalanlarÄ±n ve seri tavan yapanlarÄ±n gerÃ§ek farkÄ±nÄ± Ã¶Ärenmek.']
-    return '\n'.join(lines)
-
-def run_once():
-    c=db()
-    codes=symbol_list(c)
-    yfs=[f'{x}.IS' for x in codes]
-    print('[BIST] sembol',len(codes))
-
-    idx=download_index('6mo')
-    frames=download_daily(yfs,'6mo')
-    saved=good=0
-    for code in codes:
-        df=frames.get(f'{code}.IS')
-        if df is None or df.empty:
-            continue
-        try:
-            rows=features_for_symbol(code,df,idx)
-            if rows:
-                saved+=save_rows(c,rows)
-                good+=1
-        except Exception as e:
-            print('[FEATURE HATA]',code,e)
-
-    c.commit()
-    total=c.execute('select count(*) from daily_features').fetchone()[0] or 0
-    print(f'[BIST ÃÄRENÄ°YOR] kod={len(codes)} veri_ok={good} rows_yazildi={saved} db_toplam={total}')
-
-    # Veri gerÃ§ekten oluÅmadan "0/0" Ã¶Ärenme raporu gÃ¶nderme.
-    if total==0:
-        tg(
-            'â ï¸ BIST ÃÄRENME VERÄ°SÄ° OLUÅMADI\n'
-            f'KAP kodu: {len(codes)} | Yahoo veri OK: {good} | SatÄ±r: {saved}\n'
-            '0/0 raporu gÃ¶nderilmedi. Railway logunda [YF] ve [FEATURE HATA] satÄ±rlarÄ±nÄ± kontrol et.'
-        )
-        c.close()
+def yuzde5_takip_baslat(aday):
+    symbol = aday.get("symbol")
+    giris = float(aday.get("fiyat", 0) or 0)
+    if not symbol or giris <= 0:
         return
 
-    meta_set(c,'last_run_day',datetime.now(LOCAL_TZ).date().isoformat())
-    c.commit()
-    tg(report(c))
-    c.close()
+    # Aynı coin için aktif takip varsa ikinci kayıt açma.
+    for k in reversed(YUZDE5_KAYITLARI[-100:]):
+        if k.get("symbol") == symbol and not k.get("tamamlandi"):
+            return
 
-def should_run(c):
-    now=datetime.now(LOCAL_TZ)
-    if now.weekday()>=5:return False
-    if meta_get(c,'last_run_day')==now.date().isoformat():return False
-    return now.hour>RUN_AFTER_HOUR or (now.hour==RUN_AFTER_HOUR and now.minute>=RUN_AFTER_MINUTE)
+    YUZDE5_KAYITLARI.append({
+        "symbol": symbol,
+        "zaman": time.time(),
+        "giris": giris,
+        "max_getiri": 0.0,
+        "min_getiri": 0.0,
+        "tamamlandi": False,
+        "tamamlanma_zamani": 0.0,
+    })
+    del YUZDE5_KAYITLARI[:-20000]
+    _json_kaydet(_YUZDE5_KAYIT_DOSYA, YUZDE5_KAYITLARI)
 
-def main():
-    setup(); print('BIST TAVAN OGRENEN BOT V1.5 CACHE + CIRCUIT + INVALID',DB_PATH)
-    tg('ð§  BIST TAVAN ÃÄRENEN BOT BAÅLADI\nSadece BIST100 deÄil, KAP iÃ§indeki BIST Åirketlerinin tamamÄ±nÄ± izleyecek.\nHedef: Her gÃ¼n tavan gÃ¶renleri bulup, tavan olmadan Ã¶nce diÄer hisselerden hangi Ã¶zelliklerle ayrÄ±ldÄ±klarÄ±nÄ± Ã¶Ärenmek.\nÄ°lk aÅamada AL/SAT mesajÄ± yok.')
-    while True:
-        c=db()
-        try:run=should_run(c)
-        finally:c.close()
-        if run:
-            try:run_once()
-            except Exception as e:print('[GENEL HATA]',e)
-        time.sleep(LOOP_SECONDS)
 
-if __name__=='__main__': main()
+def yuzde5_takip_guncelle(ticker):
+    if not YUZDE5_KAYITLARI:
+        return
+
+    fiyatlar = {}
+    for coin in ticker:
+        try:
+            sym = coin.get("pair", "")
+            fiyat = float(coin.get("last", 0) or 0)
+            if sym and fiyat > 0:
+                fiyatlar[sym] = fiyat
+        except Exception:
+            pass
+
+    simdi = time.time()
+    degisti = False
+
+    for k in YUZDE5_KAYITLARI:
+        if k.get("tamamlandi"):
+            continue
+
+        giris = float(k.get("giris", 0) or 0)
+        fiyat = fiyatlar.get(k.get("symbol"))
+        if fiyat and giris > 0:
+            getiri = ((fiyat - giris) / giris) * 100
+            k["max_getiri"] = round(max(float(k.get("max_getiri", 0) or 0), getiri), 3)
+            k["min_getiri"] = round(min(float(k.get("min_getiri", 0) or 0), getiri), 3)
+            degisti = True
+
+        if simdi - float(k.get("zaman", simdi) or simdi) >= YUZDE5_IZLEME_SURESI:
+            k["tamamlandi"] = True
+            k["tamamlanma_zamani"] = simdi
+            degisti = True
+
+    if degisti:
+        _json_kaydet(_YUZDE5_KAYIT_DOSYA, YUZDE5_KAYITLARI)
+
+
+def yuzde5_basariraporu_gerekirse_gonder():
+    global YUZDE5_META
+
+    simdi = time.time()
+    son_rapor = float(YUZDE5_META.get("son_rapor", YUZDE5_META.get("baslangic", simdi)) or simdi)
+    if simdi - son_rapor < YUZDE5_RAPOR_ARALIGI:
+        return
+
+    pencere_bas = son_rapor
+    pencere_son = simdi
+
+    tum = [
+        x for x in YUZDE5_KAYITLARI
+        if pencere_bas <= float(x.get("zaman", 0) or 0) < pencere_son
+    ]
+    tamam = [x for x in tum if x.get("tamamlandi")]
+    acik = [x for x in tum if not x.get("tamamlandi")]
+    basarili = [x for x in tamam if float(x.get("max_getiri", 0) or 0) >= 5.0]
+    basarisiz = [x for x in tamam if float(x.get("max_getiri", 0) or 0) < 5.0]
+
+    oran = (len(basarili) / len(tamam) * 100.0) if tamam else 0.0
+    ort_tepe = (
+        sum(float(x.get("max_getiri", 0) or 0) for x in tamam) / len(tamam)
+        if tamam else 0.0
+    )
+
+    mesaj = (
+        f"📊 24 SAATLİK +%5 YAKALAMA RAPORU — {YUZDE5_RAPOR_ETIKETI}\n\n"
+        f"Tamamlanan sinyal: {len(tamam)}\n"
+        f"+%5 yapan: {len(basarili)}\n"
+        f"+%5 yapamayan: {len(basarisiz)}\n"
+        f"🎯 +%5 başarı: %{oran:.1f}\n"
+        f"Ortalama tepe getiri: %{ort_tepe:+.2f}\n"
+        f"Henüz tamamlanmayan: {len(acik)}\n\n"
+        f"Not: Başarı = AL fiyatından sonra 3 saat içinde en az +%5 tepe görmek."
+    )
+
+    print(mesaj)
+    telegram_gonder(mesaj)
+
+    YUZDE5_META["son_rapor"] = simdi
+    _json_kaydet(_YUZDE5_META_DOSYA, YUZDE5_META)
+
+
+
+
+
+STABLE_COINLER = [
+    "USDT", "USDC", "FDUSD", "TUSD", "DAI", "USDP"
+]
+
+
+
+
+RSS_KAYNAKLARI = [
+    "https://cointelegraph.com/rss",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml"
+]
+
+POZITIF = [
+    "listing", "listed", "binance", "coinbase", "partnership",
+    "etf", "airdrop", "burn", "launch", "mainnet", "upgrade",
+    "integration", "support", "investment", "funding", "approval",
+    "adoption", "bullish", "surge", "rally"
+]
+
+NEGATIF = [
+    "hack", "exploit", "lawsuit", "delist", "sec", "attack",
+    "scam", "fraud", "investigation", "outage", "halted",
+    "stopped", "shutdown", "pressure", "bearish", "loss",
+    "dump", "decline", "crash", "selloff", "down", "weakness"
+]
+
+
+def telegram_gonder(mesaj):
+    if not BOT_TOKEN:
+        print("BOT_TOKEN bulunamadı. Railway Variables kontrol et.")
+        return
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+    for chat_id in CHAT_IDS:
+        try:
+            r = requests.get(
+                url,
+                params={"chat_id": chat_id, "text": mesaj},
+                timeout=10
+            )
+            print(chat_id, r.text)
+        except Exception as e:
+            print(chat_id, e)
+
+
+def veri_getir(symbol, saat=24):
+    simdi = int(time.time())
+    url = (
+        f"https://graph-api.btcturk.com/v1/klines/history?"
+        f"symbol={symbol}&resolution=60&from={simdi - (saat * 3600)}&to={simdi}"
+    )
+    return requests.get(url, timeout=10).json()
+
+
+
+def btc_degisimleri():
+    """
+    V4.25 BTC Gücü V2 için BTC'nin 1s, 3s ve 24s değişimini hesaplar.
+    """
+    try:
+        d = veri_getir("BTCTRY", 24)
+        c = d["c"]
+
+        if len(c) < 24:
+            return {"1s": 0, "3s": 0, "24s": 0}
+
+        return {
+            "1s": ((c[-1] - c[-2]) / c[-2]) * 100,
+            "3s": ((c[-1] - c[-4]) / c[-4]) * 100,
+            "24s": ((c[-1] - c[-24]) / c[-24]) * 100
+        }
+    except Exception:
+        return {"1s": 0, "3s": 0, "24s": 0}
+
+
+def btc_gucu_v2_hesapla(degisim1, degisim3, degisim24, btc_d):
+    """
+    V4.25 BTC Gücü V2.
+    Sadece BTC'den güçlü mü sorusuna bakmaz; 1s, 3s ve 24s farkını 0-10 puana çevirir.
+    """
+    fark1 = degisim1 - btc_d.get("1s", 0)
+    fark3 = degisim3 - btc_d.get("3s", 0)
+    fark24 = degisim24 - btc_d.get("24s", 0)
+
+    puan = 0
+
+    if fark1 >= 0.5:
+        puan += 2
+    elif fark1 >= 0:
+        puan += 1
+
+    if fark3 >= 3:
+        puan += 4
+    elif fark3 >= 1.5:
+        puan += 3
+    elif fark3 >= 0.5:
+        puan += 2
+
+    if fark24 >= 5:
+        puan += 4
+    elif fark24 >= 3:
+        puan += 3
+    elif fark24 >= 1:
+        puan += 2
+
+    return min(puan, 10), fark1, fark3, fark24
+
+
+def lider_skoru_hesapla(hacim_kat, degisim1, degisim3, degisim24, btc_fark1, btc_fark3, btc_fark24, zirve_yakin, yeni_zirve):
+    """
+    V4.25 Lider Skoru.
+    Coinin sadece hareket edip etmediğini değil, piyasanın liderlerinden biri olup olmadığını ölçer.
+    """
+    puan = 0
+
+    if btc_fark24 >= 5:
+        puan += 3
+    elif btc_fark24 >= 2:
+        puan += 2
+
+    if btc_fark3 >= 2:
+        puan += 2
+    elif btc_fark3 >= 1:
+        puan += 1
+
+    if degisim24 >= 6:
+        puan += 2
+    elif degisim24 >= 3:
+        puan += 1
+
+    if hacim_kat >= 10 and degisim1 >= 0 and degisim3 > 0:
+        puan += 2
+    elif hacim_kat >= 5 and degisim3 > 0:
+        puan += 1
+
+    if yeni_zirve:
+        puan += 1
+    elif zirve_yakin:
+        puan += 0.5
+
+    return min(puan, 10)
+
+
+
+
+
+def guc_skoru_hesapla(
+    hacim_kat,
+    degisim1,
+    degisim3,
+    degisim24,
+    btc_guc_skoru,
+    lider_skoru,
+    haber_skoru,
+    satis_baskisi,
+    btc_fark3=0,
+    zirve_yakin=False,
+    yeni_zirve=False
+):
+    """
+    Son çalışan Coin Radar eşiklerine uyarlanmış 0-100 aday skoru.
+    Momentum daha ağır, yüksek hacim ise momentum/liderlik teyidi olmadan tek başına ödüllendirilmez.
+    """
+    hacim_puan = min(hacim_kat / 10, 1) * 18
+    momentum_puan = min(max(degisim3, 0) / 6, 1) * 34
+    btc_puan = (btc_guc_skoru / 10) * 20
+    lider_puan = (lider_skoru / 10) * 15
+    haber_puan = (min(haber_skoru, 20) / 20) * 10
+
+    toplam = hacim_puan + momentum_puan + btc_puan + lider_puan + haber_puan
+
+    # Son Coin Radar: 3s momentum ana ayırıcı.
+    if degisim3 >= 6:
+        toplam += 6
+    elif degisim3 >= 4:
+        toplam += 3
+    elif degisim3 >= 2:
+        toplam += 1
+
+    # Çok yüksek hacim tek başına güçlü aday sayılmaz.
+    if hacim_kat >= 15 and degisim3 >= 6:
+        toplam += 2
+    elif hacim_kat >= 10 and degisim3 >= 4:
+        toplam += 1
+    elif hacim_kat >= 10 and degisim3 < 4 and lider_skoru < 7:
+        toplam -= 4
+
+    if btc_fark3 >= 4:
+        toplam += 2
+    elif btc_fark3 >= 2:
+        toplam += 1
+
+    if lider_skoru >= 7:
+        toplam += 2
+    elif lider_skoru >= 5:
+        toplam += 1
+
+    if zirve_yakin or yeni_zirve:
+        toplam += 1
+
+    if satis_baskisi:
+        toplam -= 12
+
+    return round(max(min(toplam, 100), 0), 2)
+
+
+def stable_coin_mi(symbol):
+    coin = symbol.replace("TRY", "")
+    return coin in STABLE_COINLER
+
+
+def haber_puani(symbol):
+    coin = symbol.replace("TRY", "").lower()
+    puan = 0
+    negatif_haber = False
+
+    for kaynak in RSS_KAYNAKLARI:
+        try:
+            feed = feedparser.parse(kaynak)
+
+            for item in feed.entries[:25]:
+                baslik = item.title.lower()
+
+                if coin in baslik:
+                    puan += 8
+
+                    for kelime in POZITIF:
+                        if kelime in baslik:
+                            puan += 5
+
+                    for kelime in NEGATIF:
+                        if kelime in baslik:
+                            puan -= 15
+                            negatif_haber = True
+        except:
+            pass
+
+    puan = max(min(puan, 20), 0)
+
+    if negatif_haber and puan < 10:
+        puan = 0
+
+    return puan
+
+
+
+# ==========================================
+# H MANTIĞI - TEKNİK ANALİZ KATMANI
+# Commit: AI AL V3.2 - Roket RSI ust siniri 75
+# Bu katman aday seçimini değiştirmez; Top 10 adayı analiz için zenginleştirir.
+# ==========================================
+
+def ema_hesapla(veriler, periyot):
+    if len(veriler) < periyot:
+        return None
+    ema = sum(veriler[:periyot]) / periyot
+    k = 2 / (periyot + 1)
+    for fiyat in veriler[periyot:]:
+        ema = fiyat * k + ema * (1 - k)
+    return ema
+
+
+def ema_serisi(veriler, periyot):
+    if len(veriler) < periyot:
+        return []
+    sonuc = [None] * (periyot - 1)
+    ema = sum(veriler[:periyot]) / periyot
+    sonuc.append(ema)
+    k = 2 / (periyot + 1)
+    for fiyat in veriler[periyot:]:
+        ema = fiyat * k + ema * (1 - k)
+        sonuc.append(ema)
+    return sonuc
+
+
+def rsi_hesapla(kapanislar, periyot=14):
+    if len(kapanislar) < periyot + 1:
+        return None
+    farklar = [kapanislar[i] - kapanislar[i - 1] for i in range(1, len(kapanislar))]
+    kazanclar = [max(x, 0) for x in farklar]
+    kayiplar = [max(-x, 0) for x in farklar]
+    ort_kazanc = sum(kazanclar[:periyot]) / periyot
+    ort_kayip = sum(kayiplar[:periyot]) / periyot
+    for i in range(periyot, len(farklar)):
+        ort_kazanc = ((ort_kazanc * (periyot - 1)) + kazanclar[i]) / periyot
+        ort_kayip = ((ort_kayip * (periyot - 1)) + kayiplar[i]) / periyot
+    if ort_kayip == 0:
+        return 100.0
+    rs = ort_kazanc / ort_kayip
+    return 100 - (100 / (1 + rs))
+
+
+def macd_hesapla(kapanislar):
+    ema12 = ema_serisi(kapanislar, 12)
+    ema26 = ema_serisi(kapanislar, 26)
+    if not ema12 or not ema26:
+        return None, None, None
+    macd_seri = []
+    for i in range(len(kapanislar)):
+        if i < len(ema12) and i < len(ema26) and ema12[i] is not None and ema26[i] is not None:
+            macd_seri.append(ema12[i] - ema26[i])
+    if len(macd_seri) < 9:
+        return None, None, None
+    sinyal = ema_hesapla(macd_seri, 9)
+    macd = macd_seri[-1]
+    histogram = macd - sinyal if sinyal is not None else None
+    return macd, sinyal, histogram
+
+
+def atr_adx_hesapla(yuksekler, dusukler, kapanislar, periyot=14):
+    if len(kapanislar) < (periyot * 2) + 1:
+        return None, None
+    tr, arti_dm, eksi_dm = [], [], []
+    for i in range(1, len(kapanislar)):
+        yukari = yuksekler[i] - yuksekler[i - 1]
+        asagi = dusukler[i - 1] - dusukler[i]
+        arti_dm.append(yukari if yukari > asagi and yukari > 0 else 0)
+        eksi_dm.append(asagi if asagi > yukari and asagi > 0 else 0)
+        tr.append(max(
+            yuksekler[i] - dusukler[i],
+            abs(yuksekler[i] - kapanislar[i - 1]),
+            abs(dusukler[i] - kapanislar[i - 1])
+        ))
+
+    atr = sum(tr[:periyot]) / periyot
+    arti_s = sum(arti_dm[:periyot])
+    eksi_s = sum(eksi_dm[:periyot])
+    dxler = []
+
+    for i in range(periyot, len(tr)):
+        atr = ((atr * (periyot - 1)) + tr[i]) / periyot
+        arti_s = arti_s - (arti_s / periyot) + arti_dm[i]
+        eksi_s = eksi_s - (eksi_s / periyot) + eksi_dm[i]
+        arti_di = 100 * (arti_s / (atr * periyot)) if atr else 0
+        eksi_di = 100 * (eksi_s / (atr * periyot)) if atr else 0
+        toplam = arti_di + eksi_di
+        dxler.append(100 * abs(arti_di - eksi_di) / toplam if toplam else 0)
+
+    if len(dxler) < periyot:
+        return atr, None
+    adx = sum(dxler[:periyot]) / periyot
+    for dx in dxler[periyot:]:
+        adx = ((adx * (periyot - 1)) + dx) / periyot
+    return atr, adx
+
+
+def teknik_analiz_hesapla(symbol):
+    try:
+        d = veri_getir(symbol, 120)
+        c = d.get("c", [])
+        h = d.get("h", [])
+        l = d.get("l", [])
+        if len(c) < 55 or len(h) != len(c) or len(l) != len(c):
+            return None
+
+        ema20 = ema_hesapla(c, 20)
+        ema50 = ema_hesapla(c, 50)
+        rsi = rsi_hesapla(c, 14)
+        macd, macd_sinyal, macd_hist = macd_hesapla(c)
+        atr, adx = atr_adx_hesapla(h, l, c, 14)
+        fiyat = c[-1]
+        atr_yuzde = (atr / fiyat) * 100 if atr is not None and fiyat else None
+
+        return {
+            "ema20": round(ema20, 6) if ema20 is not None else None,
+            "ema50": round(ema50, 6) if ema50 is not None else None,
+            "rsi": round(rsi, 2) if rsi is not None else None,
+            "macd": round(macd, 6) if macd is not None else None,
+            "macd_sinyal": round(macd_sinyal, 6) if macd_sinyal is not None else None,
+            "macd_hist": round(macd_hist, 6) if macd_hist is not None else None,
+            "adx": round(adx, 2) if adx is not None else None,
+            "atr": round(atr, 6) if atr is not None else None,
+            "atr_yuzde": round(atr_yuzde, 2) if atr_yuzde is not None else None
+        }
+    except Exception as e:
+        print(f"Teknik analiz hata ({symbol}):", e)
+        return None
+
+
+# ==========================================
+# H MANTIĞI - KARAR MOTORU
+# Radar ilk adayları bulur; bu katman teknik yapıyı AL / BEKLE / SAT-PAS kararına çevirir.
+# ==========================================
+
+def h_karar_hesapla(aday):
+    """
+    AI karar motoru V3 - bağımsız AL teyidi.
+    Amaç: Coin Radar adayını otomatik onaylamak yerine bağımsız teknik AL teyidi vermek.
+    AVNT/ENA gibi zayıf devam teyitlerinde AL'ı zorlaştırır;
+    NAP/MIRA gibi güçlü trendleri ve H gibi istisnai Yıldız devamlarını korur.
+    """
+    teknik = aday.get("teknik")
+    if not teknik:
+        return {
+            "ai_skoru": 0,
+            "karar": "🟡 BEKLE",
+            "risk": "Bilinmiyor",
+            "nedenler": ["Teknik veri yetersiz"]
+        }
+
+    ema20 = teknik.get("ema20")
+    ema50 = teknik.get("ema50")
+    rsi = teknik.get("rsi")
+    macd_hist = teknik.get("macd_hist")
+    adx = teknik.get("adx")
+    atr_yuzde = teknik.get("atr_yuzde")
+
+    fiyat = aday.get("fiyat", 0)
+    radar = aday.get("radar_skoru", 0)
+    kategori = aday.get("radar_kategori", "")
+    lider = aday.get("lider_skoru", 0)
+    deg1 = aday.get("degisim1", 0)
+    deg3 = aday.get("degisim3", 0)
+    deg24 = aday.get("degisim24", 0)
+
+    skor = 20.0
+    nedenler = []
+
+    # 1) Radar kalitesi: artık taban skoru şişirmiyor.
+    skor += max(0, min((radar - 55) * 0.50, 20))
+
+    # Radar alarm seviyesine küçük kalite bonusu.
+    if "Yıldız" in kategori:
+        skor += 10
+        nedenler.append("Radar Yıldız")
+    elif "Elit" in kategori:
+        skor += 6
+    elif "Trader" in kategori:
+        skor += 4
+    elif "Roket" in kategori:
+        skor += 2
+
+    # 2) EMA: önemli ama tek başına veto değil.
+    if ema20 is not None and ema50 is not None:
+        if ema20 > ema50:
+            skor += 12
+            nedenler.append("EMA trendi yukarı")
+        else:
+            skor -= 8
+            nedenler.append("EMA trendi aşağı")
+
+        if fiyat and ema20:
+            if fiyat > ema20:
+                skor += 4
+            else:
+                skor -= 5
+
+    # 3) RSI: 50-65 en temiz giriş bölgesi.
+    if rsi is not None:
+        if 50 <= rsi <= 65:
+            skor += 12
+            nedenler.append("RSI sağlıklı güçlü bölgede")
+        elif 45 <= rsi < 50:
+            skor += 5
+        elif 65 < rsi <= 72:
+            skor += 6
+            nedenler.append("RSI güçlü ama ısınıyor")
+        elif 72 < rsi <= 78:
+            skor += 1
+            nedenler.append("RSI yüksek")
+        elif 78 < rsi <= 85:
+            skor -= 7
+            nedenler.append("RSI aşırı alıma yakın")
+        elif rsi > 85:
+            skor -= 12
+            nedenler.append("RSI aşırı alım")
+        elif rsi < 40:
+            skor -= 10
+            nedenler.append("RSI zayıf")
+
+    # 4) MACD: devam teyidi.
+    macd_pozitif = macd_hist is not None and macd_hist > 0
+    if macd_hist is not None:
+        if macd_pozitif:
+            skor += 12
+            nedenler.append("MACD pozitif")
+        else:
+            skor -= 14
+            nedenler.append("MACD negatif")
+
+    # 5) ADX: AL kararının ana ayırıcılarından biri.
+    if adx is not None:
+        if adx >= 40:
+            skor += 18
+            nedenler.append("Trend çok güçlü")
+        elif adx >= 30:
+            skor += 14
+            nedenler.append("Trend çok güçlü")
+        elif adx >= 25:
+            skor += 9
+            nedenler.append("Trend güçlü")
+        elif adx >= 20:
+            skor += 3
+            nedenler.append("Trend orta")
+        else:
+            skor -= 8
+            nedenler.append("Trend gücü düşük")
+
+    # 6) ATR: sağlıklı hareketi ödüllendir, aşırı oynaklığı azalt.
+    if atr_yuzde is not None:
+        if 1 <= atr_yuzde <= 4.5:
+            skor += 5
+        elif atr_yuzde > 7:
+            skor -= 10
+            nedenler.append("Volatilite çok yüksek")
+        elif atr_yuzde > 5:
+            skor -= 5
+            nedenler.append("Volatilite yüksek")
+
+    # 7) Göreceli güç ve liderlik.
+    if aday.get("btcden_guclu"):
+        skor += 4
+
+    if lider >= 7:
+        skor += 5
+    elif lider >= 5:
+        skor += 2
+
+    # 8) Momentum kalitesi.
+    # Çok yükselmiş olmak tek başına kötü değildir; devam gücü varsa H gibi hareketler korunur.
+    if 1 <= deg1 <= 4:
+        skor += 5
+    elif 4 < deg1 <= 8:
+        skor += 2
+    elif deg1 > 8:
+        skor -= 4
+
+    if 3 <= deg3 <= 8:
+        skor += 7
+    elif 8 < deg3 <= 15:
+        skor += 4
+    elif deg3 > 15:
+        skor += 1
+
+    if deg24 > 30:
+        skor -= 5
+
+    # ADX düşükken 100/100 görünmesini engelle.
+    if adx is not None:
+        if adx < 20:
+            skor = min(skor, 74)
+        elif adx < 25:
+            skor = min(skor, 82)
+        elif adx < 30 and "Yıldız" not in kategori:
+            skor = min(skor, 90)
+
+    skor = round(max(0, min(skor, 100)), 1)
+
+    # --------------------------------------------------
+    # AL KAPISI V3
+    # Radar adayı bulur; AI Assistant bağımsız teknik teyit ister.
+    # Amaç: Radar'a düşen her coine otomatik AL dememek.
+    # --------------------------------------------------
+    ema_yukari = (
+        ema20 is not None
+        and ema50 is not None
+        and ema20 > ema50
+        and fiyat > ema20
+    )
+
+    rsi_temiz = rsi is not None and 48 <= rsi <= 75
+    rsi_kabul = rsi is not None and 45 <= rsi <= 75
+
+    # Normal Radar adayında artık daha sıkı teknik teyit:
+    # EMA yukarı + sağlıklı RSI + güçlü ADX + pozitif MACD + yüksek AI skoru.
+    normal_al = (
+        not aday.get("erken_aday", False)
+        and ema_yukari
+        and rsi_temiz
+        and macd_pozitif
+        and adx is not None
+        and adx >= 27
+        and skor >= 80
+    )
+
+    # Çok güçlü Elit sinyalde RSI biraz daha geniş olabilir,
+    # ama EMA ve trend teyidi yine zorunlu.
+    elit_al = (
+        "Elit" in kategori
+        and radar >= 82
+        and ema_yukari
+        and rsi_kabul
+        and macd_pozitif
+        and adx is not None
+        and adx >= 28
+        and skor >= 85
+    )
+
+    # Yıldız istisnası:
+    # H örneğinde olduğu gibi çok güçlü devam hareketlerinde EMA aşağı olsa bile
+    # Radar + liderlik + ADX + MACD + momentum birlikte güçlü ise AL korunabilir.
+    yildiz_istisna = (
+        "Yıldız" in kategori
+        and radar >= 90
+        and lider >= 7
+        and aday.get("btcden_guclu")
+        and macd_pozitif
+        and adx is not None
+        and adx >= 28
+        and rsi is not None
+        and rsi >= 50
+        and deg3 >= 8
+        and skor >= 85
+    )
+
+    # Early Capture ayrı tutulur:
+    # erken yakalamanın amacı daha düşük Radar skorunda teknik güçlenmeyi yakalamak.
+    # Bu yüzden Radar yüksekliği değil, temiz teknik yapı aranır.
+    erken_al = (
+        aday.get("erken_aday", False)
+        and ema_yukari
+        and rsi is not None
+        and 48 <= rsi <= 70
+        and macd_pozitif
+        and adx is not None
+        and adx >= 30
+        and skor >= 80
+    )
+
+    if normal_al or elit_al or yildiz_istisna or erken_al:
+        karar = "🟢 AL"
+    elif skor >= 55:
+        karar = "🟡 BEKLE"
+    else:
+        karar = "🔴 SAT / PAS"
+
+    # Risk sadece bilgilendirme; Telegram yalnızca AL kararında konuşuyor.
+    if atr_yuzde is None:
+        risk = "Bilinmiyor"
+    elif atr_yuzde <= 3:
+        risk = "Düşük"
+    elif atr_yuzde <= 5:
+        risk = "Orta"
+    else:
+        risk = "Yüksek"
+
+    if not nedenler:
+        nedenler.append("Teknik göstergeler karışık")
+
+    return {
+        "ai_skoru": skor,
+        "karar": karar,
+        "risk": risk,
+        "nedenler": nedenler[:4]
+    }
+
+
+while True:
+    try:
+        print()
+        print("AI COIN ASSISTANT - CORE")
+        print("--------------------------------")
+
+        btc_d = btc_degisimleri()
+        btc = btc_d.get("3s", 0)
+
+        tarama_sayaci += 1
+        tam_tarama = (tarama_sayaci == 1 or tarama_sayaci % TAM_TARAMA_DONGUSU == 0)
+
+        if tam_tarama:
+            print("Tarama modu: TAM PIYASA TARAMASI")
+        else:
+            print("Tarama modu: HIZLI HAREKET TARAMASI")
+
+        ticker_response = requests.get(
+            "https://api.btcturk.com/api/v2/ticker",
+            timeout=10
+        )
+        ticker_response.raise_for_status()
+        ticker = ticker_response.json().get("data", [])
+
+        # Mevcut ticker cevabını kullanır; ek API isteği oluşturmaz.
+        yuzde5_takip_guncelle(ticker)
+        yuzde5_basariraporu_gerekirse_gonder()
+
+        adaylar = []
+
+        for coin in ticker:
+            try:
+                symbol = coin.get("pair", "")
+
+                if not symbol.endswith("TRY"):
+                    continue
+                if symbol == "BTCTRY":
+                    continue
+                if stable_coin_mi(symbol):
+                    continue
+                if len(symbol) > 15:
+                    continue
+
+                # 1 dakikalık hızlı ön tarama:
+                # Ticker fiyatını önceki dakikayla karşılaştır.
+                try:
+                    ticker_fiyat = float(coin.get("last", 0) or 0)
+                except (TypeError, ValueError):
+                    ticker_fiyat = 0
+
+                onceki_fiyat = son_fiyatlar.get(symbol)
+                hizli_degisim = 0.0
+
+                if ticker_fiyat > 0 and onceki_fiyat and onceki_fiyat > 0:
+                    hizli_degisim = ((ticker_fiyat - onceki_fiyat) / onceki_fiyat) * 100
+
+                if ticker_fiyat > 0:
+                    son_fiyatlar[symbol] = ticker_fiyat
+
+                # 5 dakikalık tam taramalar arasında:
+                # - %0.40+ hızlı hareket eden coinler,
+                # - veya Çoklu Güç Havuzu'nda bulunan coinler
+                # derin analiz edilir.
+                simdi = time.time()
+                izleme_bitis = guc_izleme_havuzu.get(symbol, 0)
+                havuzda = izleme_bitis > simdi
+
+                if izleme_bitis and not havuzda:
+                    guc_izleme_havuzu.pop(symbol, None)
+
+                if not tam_tarama and abs(hizli_degisim) < HIZLI_HAREKET_ESIGI and not havuzda:
+                    continue
+
+                if not tam_tarama:
+                    kaynak = "HAVUZ" if havuzda and abs(hizli_degisim) < HIZLI_HAREKET_ESIGI else "HIZLI"
+                    print(f"[{kaynak}] {symbol} | 1dk: %{hizli_degisim:.2f}")
+
+                d = veri_getir(symbol, 24)
+                o = d.get("o", [])
+                h = d.get("h", [])
+                c = d.get("c", [])
+                v = d.get("v", [])
+
+                if min(len(o), len(h), len(c), len(v)) < 24:
+                    continue
+
+                fiyat = c[-1]
+                if not fiyat or not c[-2] or not c[-4] or not c[-24]:
+                    continue
+
+                degisim1 = ((c[-1] - c[-2]) / c[-2]) * 100
+                degisim3 = ((c[-1] - c[-4]) / c[-4]) * 100
+                degisim24 = ((c[-1] - c[-24]) / c[-24]) * 100
+
+                son_hacim = v[-1]
+                ort_hacim = sum(v[-6:-1]) / 5
+                if ort_hacim <= 0:
+                    continue
+
+                hacim_kat = son_hacim / ort_hacim
+
+                btc_guc_skoru, btc_fark1, btc_fark3, btc_fark24 = btc_gucu_v2_hesapla(
+                    degisim1, degisim3, degisim24, btc_d
+                )
+
+                btcden_guclu = btc_guc_skoru >= 4 and btc_fark3 >= 0.5
+                son_mum_yesil = c[-1] > o[-1]
+                zirve_yakin = fiyat > max(h[-12:-1]) * 0.995
+                yeni_zirve = fiyat >= max(h[-24:-1])
+                satis_baskisi = son_hacim > ort_hacim * 5 and degisim1 < 0
+                haber_skoru = haber_puani(symbol)
+
+                hacim_skoru = min(hacim_kat * 2, 10)
+                momentum_skoru = max(0, degisim3 * 2)
+                mum_skoru = 1 if son_mum_yesil else 0
+                zirve_skoru = 1 if zirve_yakin else 0
+
+                genel_skor = (
+                    hacim_skoru * 0.50
+                    + momentum_skoru * 0.20
+                    + btc_guc_skoru * 0.15
+                    + haber_skoru * 0.20
+                    + mum_skoru
+                    + zirve_skoru
+                )
+
+                kalite_skoru = (
+                    hacim_skoru * 0.55
+                    + momentum_skoru * 0.30
+                    + btc_guc_skoru * 0.15
+                    + mum_skoru
+                    + zirve_skoru
+                )
+
+                if hacim_kat >= 5:
+                    genel_skor += 4
+                if hacim_kat >= 8:
+                    genel_skor += 6
+
+                if haber_skoru >= 15:
+                    genel_skor += 4
+                if haber_skoru > 0 and hacim_kat > 3:
+                    genel_skor += 5
+
+                if degisim24 > 10:
+                    genel_skor -= 4
+                if degisim3 > 7:
+                    genel_skor -= 4
+                if degisim1 > 4:
+                    genel_skor -= 4
+                if degisim24 > 0 and degisim3 > degisim24 * 0.85:
+                    genel_skor -= 2
+                if degisim3 > 0 and degisim1 > degisim3 * 0.65:
+                    genel_skor -= 2
+                if hacim_kat > 7 and degisim3 > 6:
+                    genel_skor -= 3
+                if satis_baskisi:
+                    genel_skor -= 5
+
+                if btc_fark3 >= 4:
+                    genel_skor += 2
+                elif btc_fark3 >= 2:
+                    genel_skor += 1
+
+                lider_skoru = lider_skoru_hesapla(
+                    hacim_kat, degisim1, degisim3, degisim24,
+                    btc_fark1, btc_fark3, btc_fark24,
+                    zirve_yakin, yeni_zirve
+                )
+
+                if lider_skoru >= 7:
+                    genel_skor += 2
+                elif lider_skoru >= 5:
+                    genel_skor += 1
+
+                if zirve_yakin or yeni_zirve:
+                    genel_skor += 1
+
+                radar_skoru = guc_skoru_hesapla(
+                    hacim_kat, degisim1, degisim3, degisim24,
+                    btc_guc_skoru, lider_skoru, haber_skoru,
+                    satis_baskisi, btc_fark3, zirve_yakin, yeni_zirve
+                )
+
+                # --------------------------------------------------
+                # Early Capture V1 + gerçek Coin Radar alarm kapıları
+                # --------------------------------------------------
+                onceki = onceki_tarama.get(symbol)
+
+                hacim_hizlaniyor = False
+                momentum_hizlaniyor = False
+                btc_farki_aciliyor = False
+                lider_gucleniyor = False
+
+                if onceki:
+                    eski_hacim = onceki.get("hacim", hacim_kat)
+                    eski_degisim3 = onceki.get("degisim3", degisim3)
+                    eski_btc_fark3 = onceki.get("btc_fark3", btc_fark3)
+                    eski_lider = onceki.get("lider_skoru", lider_skoru)
+
+                    hacim_hizlaniyor = (
+                        eski_hacim > 0
+                        and hacim_kat >= eski_hacim * 1.25
+                        and hacim_kat - eski_hacim >= 0.8
+                    )
+                    momentum_hizlaniyor = degisim3 - eski_degisim3 >= 0.45
+                    btc_farki_aciliyor = btc_fark3 - eski_btc_fark3 >= 0.35
+                    lider_gucleniyor = lider_skoru - eski_lider >= 1
+
+                onceki_tarama[symbol] = {
+                    "hacim": hacim_kat,
+                    "degisim3": degisim3,
+                    "btc_fark3": btc_fark3,
+                    "lider_skoru": lider_skoru,
+                    "zaman": time.time()
+                }
+
+                # Dinamik hareket teyitleri:
+                # Bunlar RED/ATM tipi "nedenleri dolu" sinyallerin hareket tarafını oluşturur.
+                dinamik_teyit_sayisi = sum([
+                    bool(hacim_hizlaniyor),
+                    bool(momentum_hizlaniyor),
+                    bool(btc_farki_aciliyor),
+                    bool(lider_gucleniyor),
+                ])
+
+                # Mevcut Early yolu korunuyor; sadece 3s üst sınırı 3'ten 5'e açıldı.
+                # Böylece güçlenmeye devam eden coin Early ile Roket arasında boşluğa düşmez.
+                erken_aday = (
+                    2.5 <= hacim_kat < 8
+                    and 0.5 <= degisim3 < 5
+                    and degisim1 > 0
+                    and btc_guc_skoru >= 3
+                    and btc_fark3 >= 0
+                    and radar_skoru >= 45
+                    and kalite_skoru >= 6
+                    and not satis_baskisi
+                    and (
+                        (hacim_hizlaniyor and momentum_hizlaniyor)
+                        or (momentum_hizlaniyor and btc_farki_aciliyor)
+                        or (hacim_hizlaniyor and lider_gucleniyor)
+                    )
+                )
+
+                # ENA tipi basamaklı güçlenme:
+                # Bir anda %0.40 sıçramasa bile 3s momentumunu koruyan,
+                # hacmi canlı, BTC'ye göre zayıflamayan ve liderliği oluşan coinleri izler.
+                basamakli_trend = False
+                if onceki:
+                    eski_degisim3 = onceki.get("degisim3", degisim3)
+                    eski_hacim = onceki.get("hacim", hacim_kat)
+                    basamakli_trend = (
+                        1.0 <= degisim3 <= 10
+                        and degisim1 > 0
+                        and hacim_kat >= 1.8
+                        and hacim_kat >= eski_hacim * 0.90
+                        and degisim3 >= eski_degisim3 - 0.15
+                        and btc_fark3 >= 0
+                        and lider_skoru >= 4
+                        and not satis_baskisi
+                    )
+
+                # Çoklu Güç Havuzu adayı:
+                # Radar kategorisine girmese bile en az 2 dinamik teyidi olan
+                # veya basamaklı trendi koruyan coin teknik motora alınır.
+                guc_havuzu_adayi = (
+                    not satis_baskisi
+                    and radar_skoru >= 40
+                    and kalite_skoru >= 5
+                    and 0.5 <= degisim3 <= 10
+                    and degisim1 > -0.5
+                    and hacim_kat >= 1.8
+                    and btc_fark3 >= -0.5
+                    and (
+                        (
+                            dinamik_teyit_sayisi >= 2
+                            and (hacim_hizlaniyor or momentum_hizlaniyor)
+                        )
+                        or basamakli_trend
+                    )
+                )
+
+                if erken_aday or guc_havuzu_adayi:
+                    guc_izleme_havuzu[symbol] = time.time() + GUC_IZLEME_SURESI
+
+                yildiz_adayi = (
+                    radar_skoru >= 88
+                    and lider_skoru >= 7
+                    and btc_guc_skoru >= 7
+                    and kalite_skoru >= 14
+                    and hacim_kat >= 5
+                    and degisim1 > 1
+                    and degisim3 >= 4
+                    and zirve_yakin
+                )
+
+                elit_adayi = (
+                    radar_skoru >= 74
+                    and lider_skoru >= 5
+                    and btc_guc_skoru >= 5
+                    and kalite_skoru >= 10
+                    and hacim_kat >= 8
+                    and degisim1 > 0
+                    and degisim3 >= 3
+                    and btcden_guclu
+                )
+
+                trader_adayi = (
+                    radar_skoru >= 55
+                    and hacim_kat >= 15
+                    and btcden_guclu
+                    and btc_guc_skoru >= 4
+                    and degisim3 >= 6
+                )
+
+                roket_adayi = (
+                    radar_skoru >= 62
+                    and kalite_skoru >= 8
+                    and hacim_kat >= 5
+                    and degisim1 > 0
+                    and degisim3 >= 1.5
+                    and not (hacim_kat >= 10 and degisim3 < 4 and lider_skoru < 7)
+                    and btcden_guclu
+                    and btc_guc_skoru >= 4
+                    and (haber_skoru > 0 or lider_skoru >= 5)
+                )
+
+                if not (erken_aday or guc_havuzu_adayi or yildiz_adayi or elit_adayi or trader_adayi or roket_adayi):
+                    continue
+
+                if yildiz_adayi:
+                    radar_kategori = "⭐ Yıldız"
+                elif elit_adayi:
+                    radar_kategori = "🔥 Elit Roket"
+                elif trader_adayi:
+                    radar_kategori = "📊 Trader Hacim"
+                elif roket_adayi:
+                    radar_kategori = "🚀 Roket Adayı"
+                elif erken_aday:
+                    radar_kategori = "🌱 Erken Aday"
+                else:
+                    radar_kategori = "⚡ Güçleniyor"
+
+                adaylar.append({
+                    "symbol": symbol,
+                    "fiyat": fiyat,
+                    "radar_skoru": radar_skoru,
+                    "radar_kategori": radar_kategori,
+                    "erken_aday": erken_aday,
+                    "guc_havuzu_adayi": guc_havuzu_adayi,
+                    "basamakli_trend": basamakli_trend,
+                    "dinamik_teyit_sayisi": dinamik_teyit_sayisi,
+                    "hacim_hizlaniyor": hacim_hizlaniyor,
+                    "momentum_hizlaniyor": momentum_hizlaniyor,
+                    "btc_farki_aciliyor": btc_farki_aciliyor,
+                    "lider_gucleniyor": lider_gucleniyor,
+                    "genel_skor": round(genel_skor, 2),
+                    "kalite_skoru": round(kalite_skoru, 2),
+                    "hacim": round(hacim_kat, 2),
+                    "degisim1": round(degisim1, 2),
+                    "degisim3": round(degisim3, 2),
+                    "degisim24": round(degisim24, 2),
+                    "btcden_guclu": btcden_guclu,
+                    "btc_fark3": round(btc_fark3, 2),
+                    "btc_guc_skoru": btc_guc_skoru,
+                    "lider_skoru": round(lider_skoru, 2),
+                    "haber_skoru": haber_skoru,
+                    "zirve_yakin": zirve_yakin,
+                    "yeni_zirve": yeni_zirve
+                })
+
+            except Exception as e:
+                print(f"Coin hata ({coin.get('pair', '?')}):", e)
+
+        adaylar.sort(
+            key=lambda x: (x["radar_skoru"], x["genel_skor"]),
+            reverse=True
+        )
+
+        radar_top10 = adaylar[:10]
+
+        # Radar Top10 dışında, hareket teyidi yüksek coinleri de teknik motora sok.
+        guc_top10 = sorted(
+            [a for a in adaylar if a.get("guc_havuzu_adayi")],
+            key=lambda x: (
+                x.get("dinamik_teyit_sayisi", 0),
+                1 if x.get("basamakli_trend") else 0,
+                x.get("genel_skor", 0),
+                x.get("radar_skoru", 0),
+            ),
+            reverse=True
+        )[:10]
+
+        # Aynı coin iki listede varsa tek kez analiz edilir.
+        top10 = []
+        gorulenler = set()
+        for aday in radar_top10 + guc_top10:
+            symbol = aday.get("symbol")
+            if symbol in gorulenler:
+                continue
+            gorulenler.add(symbol)
+            top10.append(aday)
+
+        print(
+            f"Teknik havuz: RadarTop10={len(radar_top10)} | "
+            f"ÇokluGüç={len(guc_top10)} | Benzersiz={len(top10)}"
+        )
+
+        # H mantığı: Radar Top10 + Çoklu Güç Havuzu üzerinde teknik analiz + karar motoru.
+        for a in top10:
+            teknik = teknik_analiz_hesapla(a["symbol"])
+            a["teknik"] = teknik
+            karar = h_karar_hesapla(a)
+            a.update(karar)
+
+            # --------------------------------------------------
+            # AL DEBUG LOG
+            # Telegram'a hiçbir şey göndermez.
+            # Railway logunda coin neden AL / BEKLE olduğunu gösterir.
+            # --------------------------------------------------
+            if teknik:
+                ema20 = teknik.get("ema20")
+                ema50 = teknik.get("ema50")
+                rsi = teknik.get("rsi")
+                macd_hist = teknik.get("macd_hist")
+                adx = teknik.get("adx")
+                fiyat = a.get("fiyat", 0)
+                kategori = a.get("radar_kategori", "")
+                ai_skor = a.get("ai_skoru", 0)
+
+                ema_ok = (
+                    ema20 is not None
+                    and ema50 is not None
+                    and fiyat
+                    and ema20 > ema50
+                    and fiyat > ema20
+                )
+                macd_ok = macd_hist is not None and macd_hist > 0
+
+                if a.get("erken_aday"):
+                    rsi_ok = rsi is not None and 48 <= rsi <= 70
+                    adx_ok = adx is not None and adx >= 30
+                    skor_ok = ai_skor >= 80
+                elif "Elit" in kategori:
+                    rsi_ok = rsi is not None and 45 <= rsi <= 75
+                    adx_ok = adx is not None and adx >= 28
+                    skor_ok = ai_skor >= 85
+                elif "Yıldız" in kategori:
+                    # Yıldızlarda normal teknik kapıyı göster.
+                    # H tipi istisnai devam varsa karar motoru ayrıca AL verebilir.
+                    rsi_ok = rsi is not None and 48 <= rsi <= 70
+                    adx_ok = adx is not None and adx >= 30
+                    skor_ok = ai_skor >= 85
+                else:
+                    rsi_ok = rsi is not None and 48 <= rsi <= 75
+                    adx_ok = adx is not None and adx >= 27
+                    skor_ok = ai_skor >= 80
+
+                def durum(ok):
+                    return "✅" if ok else "❌"
+
+                rsi_txt = "NA" if rsi is None else f"{rsi:.1f}"
+                adx_txt = "NA" if adx is None else f"{adx:.1f}"
+                macd_txt = "NA" if macd_hist is None else f"{macd_hist:.5f}"
+
+                print(
+                    f"[AL DEBUG] {a['symbol']} | {a.get('karar', '🟡 BEKLE')} | "
+                    f"{kategori} | "
+                    f"EMA {durum(ema_ok)} | "
+                    f"RSI {rsi_txt} {durum(rsi_ok)} | "
+                    f"MACD {macd_txt} {durum(macd_ok)} | "
+                    f"ADX {adx_txt} {durum(adx_ok)} | "
+                    f"AI {ai_skor}/100 {durum(skor_ok)} | "
+                    f"Radar {a.get('radar_skoru', 0)}"
+                )
+            else:
+                print(
+                    f"[AL DEBUG] {a['symbol']} | 🟡 BEKLE | "
+                    f"Teknik veri alınamadı"
+                )
+
+        # İlk aday sıralamasını Radar yapar; H motorundan sonra en güçlü teknik fırsat üste çıkar.
+        top10.sort(
+            key=lambda x: (x.get("ai_skoru", 0), x.get("radar_skoru", 0)),
+            reverse=True
+        )
+
+        if not top10:
+            print("Şu an uygun aday yok.")
+        else:
+            gonderilecekler = []
+
+            for a in top10:
+                symbol = a["symbol"]
+                karar = a.get("karar", "🟡 BEKLE")
+                onceki_karar = son_ai_kararlar.get(symbol)
+                son_ai_kararlar[symbol] = karar
+
+                # Telegram yalnızca gerçek AL kararlarında konuşur.
+                # BEKLE ve SAT/PAS arka planda/loglarda izlenmeye devam eder.
+                if "🟢 AL" not in karar:
+                    continue
+
+                # Aynı AL kararını tekrar gönderme.
+                if onceki_karar == karar:
+                    continue
+
+                gonderilecekler.append(a)
+
+            if not gonderilecekler:
+                print("Yeni AL kararı yok. Telegram sessiz.")
+            else:
+                mesaj = (
+                    "🤖 AI COIN ASSISTANT - KARAR GÜNCELLEMESİ\n"
+                    f"BTC 3s: %{round(btc, 2)}\n\n"
+                )
+
+                for a in gonderilecekler:
+                    teknik = a.get("teknik")
+                    if not teknik:
+                        continue
+
+                    ema_yon = "Yukarı" if teknik["ema20"] > teknik["ema50"] else "Aşağı"
+                    macd_yon = "Pozitif" if teknik["macd_hist"] is not None and teknik["macd_hist"] > 0 else "Negatif"
+                    nedenler = list(a.get("nedenler", []))
+                    hizlar = []
+
+                    if a.get("hacim_hizlaniyor"):
+                        hizlar.append("hacim hızlanıyor")
+                    if a.get("momentum_hizlaniyor"):
+                        hizlar.append("momentum hızlanıyor")
+                    if a.get("btc_farki_aciliyor"):
+                        hizlar.append("BTC farkı açılıyor")
+                    if a.get("lider_gucleniyor"):
+                        hizlar.append("lider güçleniyor")
+                    if a.get("basamakli_trend"):
+                        hizlar.append("basamaklı trend korunuyor")
+
+                    if hizlar:
+                        baslik = "Erken yakalama" if a.get("erken_aday") else "Hareket teyidi"
+                        nedenler.insert(0, baslik + ": " + ", ".join(hizlar))
+
+                    # 6+ gerçek olumlu neden varsa yalnızca Neden başına alarm koy.
+                    # AL kararı veya filtrelerde hiçbir etkisi yok.
+                    toplam_neden_sayisi = len(a.get("nedenler", [])) + len(hizlar)
+                    neden_alarm = "🚨 🚨 " if toplam_neden_sayisi >= 6 else ""
+                    neden = " • ".join(nedenler[:5])
+
+                    mesaj += (
+                        f"{a['symbol']} | {a.get('radar_kategori', '')}\n"
+                        f"{a.get('karar')} | AI Skoru: {a.get('ai_skoru', 0)}/100 | Risk: {a.get('risk', 'Bilinmiyor')}\n"
+                        f"Radar: {a['radar_skoru']}/100 | Fiyat: {round(a['fiyat'], 4)} | Hacim: {a['hacim']}x\n"
+                        f"1s: %{a['degisim1']} | 3s: %{a['degisim3']} | 24s: %{a['degisim24']}\n"
+                        f"EMA: {ema_yon} | RSI: {teknik['rsi']} | ADX: {teknik['adx']}\n"
+                        f"MACD: {macd_yon} | ATR: %{teknik['atr_yuzde']}\n"
+                        f"{neden_alarm}Neden: {neden}\n\n"
+                    )
+
+                print(mesaj)
+                telegram_gonder(mesaj)
+
+                # Yalnız Telegram'a gerçekten gönderilen yeni AL sinyallerini +%5 için takip et.
+                for _a in gonderilecekler:
+                    yuzde5_takip_baslat(_a)
+
+        print("60 sn bekleniyor...")
+        time.sleep(TARAMA_SURESI)
+
+    except Exception as e:
+        print("Bot genel hata:", e)
+        time.sleep(30)
