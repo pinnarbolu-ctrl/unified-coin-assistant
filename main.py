@@ -9,7 +9,10 @@
 import os
 import time
 import requests
-import feedparser
+try:
+    import feedparser
+except ModuleNotFoundError:
+    feedparser = None
 import json
 
 
@@ -409,6 +412,11 @@ def stable_coin_mi(symbol):
 
 
 def haber_puani(symbol):
+    # Railway'de feedparser kurulu değilse botu çökertme.
+    # Haber puanı o taramada 0 kabul edilir; aday/teknik motor çalışmaya devam eder.
+    if feedparser is None:
+        return 0
+
     coin = symbol.replace("TRY", "").lower()
     puan = 0
     negatif_haber = False
@@ -431,7 +439,7 @@ def haber_puani(symbol):
                         if kelime in baslik:
                             puan -= 15
                             negatif_haber = True
-        except:
+        except Exception:
             pass
 
     puan = max(min(puan, 20), 0)
