@@ -39,11 +39,11 @@ GUC_IZLEME_SURESI = 5 * 60
 # Aynı kararın tekrar Telegram gönderimini engeller.
 son_ai_kararlar = {}
 
-# 24 SAATLİK +%5 YAKALAMA BAŞARI RAPORU
+# 7 GÜNLÜK +%5 YAKALAMA BAŞARI RAPORU
 # Karşılaştırma adil olsun diye diğer Assistant testleriyle aynı mantık:
-# her AL sinyali 3 saat izlenir; 24 saatte bir o pencerenin +%5 başarı oranı raporlanır.
+# her AL sinyali 3 saat izlenir; 7 günde bir o pencerenin +%5 başarı oranı raporlanır.
 YUZDE5_IZLEME_SURESI = 3 * 60 * 60
-YUZDE5_RAPOR_ARALIGI = 24 * 60 * 60
+YUZDE5_RAPOR_ARALIGI = 7 * 24 * 60 * 60
 YUZDE5_RAPOR_ETIKETI = "MAIN13 ÇOKLU GÜÇ HAVUZU"
 
 _STATE_DIR = "/data" if os.path.isdir("/data") else "."
@@ -179,7 +179,7 @@ def yuzde5_basariraporu_gerekirse_gonder():
     )
 
     mesaj = (
-        f"📊 24 SAATLİK +%5 YAKALAMA RAPORU — {YUZDE5_RAPOR_ETIKETI}\n\n"
+        f"📊 7 GÜNLÜK +%5 YAKALAMA RAPORU — {YUZDE5_RAPOR_ETIKETI}\n\n"
         f"Tamamlanan sinyal: {len(tamam)}\n"
         f"+%5 yapan: {len(basarili)}\n"
         f"+%5 yapamayan: {len(basarisiz)}\n"
