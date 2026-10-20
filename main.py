@@ -32,7 +32,7 @@ import feedparser
 import statistics
 
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 CHAT_IDS = [2097448038]
 
